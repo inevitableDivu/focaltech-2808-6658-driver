@@ -34,9 +34,10 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     (500.0 / 25.4) /* Standard 500 DPI for NIST NBIS */
 
-#define TOUCH_DIFF_THRESHOLD 60
-#define TOUCH_MIN_SENSELS    6
-#define POLL_INTERVAL_MS     60
+#define TOUCH_DIFF_THRESHOLD   75
+#define TOUCH_MIN_SENSELS      15
+#define TOUCH_REQUIRED_STREAK  2
+#define POLL_INTERVAL_MS       60
 #define BASELINE_WARMUP_CYCLES 3
 
 /* State machine states */
@@ -61,6 +62,7 @@ struct _FpiDeviceFocaltech6658
   guint8       *frame_buf;
   gfloat       *baseline_buf;
   guint         warmup_count;
+  guint         touch_streak;
   gsize         read_offset;
   guint         poll_count;
   gboolean      deactivating;
@@ -240,6 +242,8 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         /* Calculate delta vs EMA baseline */
         gfloat max_diff = 0;
         guint touch_count = 0;
+        gfloat sum_diff = 0;
+        guint valid_count = 0;
 
         for (int i = 0; i < RAW_PIXELS; i++)
           {
@@ -249,22 +253,34 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
               {
                 gfloat diff = (c > b) ? (c - b) : (b - c);
                 if (diff > max_diff) max_diff = diff;
-                if (diff > 40.0f) touch_count++;
+                if (diff > 50.0f) touch_count++;
+                sum_diff += diff;
+                valid_count++;
               }
           }
 
+        gfloat mean_energy = (valid_count > 0) ? (sum_diff / (gfloat) valid_count) : 0;
+        gboolean is_touching = (max_diff > (gfloat) TOUCH_DIFF_THRESHOLD && touch_count >= TOUCH_MIN_SENSELS) ||
+                               (mean_energy > 4.0f);
+
+        if (is_touching)
+          self->touch_streak++;
+        else
+          self->touch_streak = 0;
+
         self->poll_count++;
-        if (self->poll_count % 10 == 0 || touch_count > 0)
+        if (self->poll_count % 10 == 0 || self->touch_streak > 0)
           {
-            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%.1f",
-                       self->poll_count, touch_count, max_diff);
+            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%.1f, mean=%.2f, streak=%u",
+                       self->poll_count, touch_count, max_diff, mean_energy, self->touch_streak);
           }
 
-        if (max_diff > (gfloat) TOUCH_DIFF_THRESHOLD && touch_count >= TOUCH_MIN_SENSELS)
+        if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
           {
-            g_message ("[focaltech_6658] *** REAL FINGER TOUCH DETECTED! (sensels=%u, max_diff=%.1f) ***",
-                       touch_count, max_diff);
+            g_message ("[focaltech_6658] *** VERIFIED PHYSICAL FINGER TOUCH DETECTED! (streak=%u, sensels=%u) ***",
+                       self->touch_streak, touch_count);
 
+            self->touch_streak = 0;
             fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
 
             /* Contrast stretch raw matrix across active range (2nd to 98th percentile) */
@@ -329,8 +345,11 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
           }
 
         /* Update EMA baseline when no touch */
-        for (int i = 0; i < RAW_PIXELS; i++)
-          self->baseline_buf[i] = self->baseline_buf[i] * 0.85f + (gfloat) cur_pixels[i] * 0.15f;
+        if (!is_touching)
+          {
+            for (int i = 0; i < RAW_PIXELS; i++)
+              self->baseline_buf[i] = self->baseline_buf[i] * 0.85f + (gfloat) cur_pixels[i] * 0.15f;
+          }
 
         g_free (cur_pixels);
         fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
@@ -369,6 +388,7 @@ focaltech_dev_open (FpImageDevice *dev)
   self->frame_buf = g_malloc0 (RAW_BUF_SIZE);
   self->baseline_buf = g_malloc0 (RAW_PIXELS * sizeof (gfloat));
   self->warmup_count = 0;
+  self->touch_streak = 0;
   self->poll_count = 0;
   fpi_image_device_open_complete (dev, NULL);
   g_message ("[focaltech_6658] Device opened successfully (2808:6658)");
@@ -395,6 +415,7 @@ focaltech_dev_activate (FpImageDevice *dev)
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   self->deactivating = FALSE;
   self->warmup_count = 0;
+  self->touch_streak = 0;
   g_message ("[focaltech_6658] Device activated");
   fpi_image_device_activate_complete (dev, NULL);
 }
@@ -427,6 +448,7 @@ focaltech_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
   if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
     {
       self->warmup_count = 0;
+      self->touch_streak = 0;
       if (!self->ssm)
         {
           self->poll_count = 0;
