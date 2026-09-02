@@ -1,0 +1,24 @@
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..20c3256 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -137,6 +137,7 @@ driver_sources = {
+     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
+     'realtek' : files('drivers/realtek/realtek.c'),
+     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
++    'focaltech_6658' : files('drivers/focaltech_6658.c'),
+     'mafpmoc' : files('drivers/mafpmoc/mafpmoc.c'),
+     'secugen' : files('drivers/secugen.c'),
+ }
+diff --git a/meson.build b/meson.build
+index ab09dc1..8407aed 100644
+--- a/meson.build
++++ b/meson.build
+@@ -145,6 +145,7 @@ drivers_info = {
+     'fpcmoc': {},
+     'realtek': {},
+     'focaltech_moc': {},
++    'focaltech_6658': {},
+     'mafpmoc': {},
+     'secugen': {},
+ 

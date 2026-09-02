@@ -26,3 +26,4 @@ build/
 # Build Artefacts
 builddir/
 subprojects/
+libfprint-source/
