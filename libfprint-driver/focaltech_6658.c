@@ -34,12 +34,12 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     ((508.0 * SCALE_FACTOR) / 25.4)
 
-#define FDT_TOUCH_THRESHOLD   50
-#define FDT_RELEASE_THRESHOLD 25
+#define FDT_TOUCH_THRESHOLD   20
+#define FDT_RELEASE_THRESHOLD 15
 #define FDT_INTEGRATION_MS    10
 #define FDT_POLL_DELAY_MS     60
 
-/* FDT Sense SSM states (each packet in separate state) */
+/* FDT Sense SSM states */
 enum {
   FDT_STATE_INIT_REG,
   FDT_STATE_INIT_WAKE,
@@ -48,8 +48,8 @@ enum {
   FDT_STATE_WAIT_POLL,
   FDT_STATE_SENSE,
   FDT_STATE_WAIT_INTEGRATE,
-  FDT_STATE_READ_CMD,
-  FDT_STATE_READ_DATA,
+  FDT_STATE_READ_STATUS,
+  FDT_STATE_READ_DELTAS,
   FDT_NUM_STATES,
 };
 
@@ -72,8 +72,7 @@ enum {
   OFF_STATE_WAIT_POLL,
   OFF_STATE_SENSE,
   OFF_STATE_WAIT_INTEGRATE,
-  OFF_STATE_READ_CMD,
-  OFF_STATE_READ_DATA,
+  OFF_STATE_READ_DELTAS,
   OFF_NUM_STATES,
 };
 
@@ -84,6 +83,7 @@ struct _FpiDeviceFocaltech6658
   guint8       *frame_buf;
   gsize         read_offset;
   guint         poll_count;
+  guint8        last_status;
   gboolean      deactivating;
 };
 
@@ -122,7 +122,24 @@ ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 /* ========================================================================= */
 
 static void
-fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+fdt_status_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (transfer->actual_length >= 1)
+    self->last_status = transfer->buffer[0];
+
+  fpi_ssm_next_state (transfer->ssm);
+}
+
+static void
+fdt_deltas_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
@@ -133,29 +150,30 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
       return;
     }
 
+  guint16 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
   if (transfer->actual_length >= 8)
     {
-      guint16 d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
-      guint16 d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
-      guint16 d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
-      guint16 d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+      d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
+      d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
+      d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
+      d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+    }
 
-      self->poll_count++;
-      if (self->poll_count % 10 == 0 || (d0 > 10 || d1 > 10 || d2 > 10 || d3 > 10))
-        {
-          g_message ("[focaltech_6658] FDT poll #%u deltas: [%d, %d, %d, %d]",
-                     self->poll_count, d0, d1, d2, d3);
-        }
+  self->poll_count++;
+  if (self->poll_count % 10 == 0 || self->last_status == 0x54 || (d0 > 5 || d1 > 5 || d2 > 5 || d3 > 5))
+    {
+      g_message ("[focaltech_6658] FDT poll #%u: st=0x%02X, deltas=[%d, %d, %d, %d]",
+                 self->poll_count, self->last_status, d0, d1, d2, d3);
+    }
 
-      if (d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
-          d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
-        {
-          g_message ("[focaltech_6658] *** Finger touch DETECTED! *** [%d, %d, %d, %d]",
-                     d0, d1, d2, d3);
-          fpi_ssm_mark_completed (transfer->ssm);
-          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
-          return;
-        }
+  if (self->last_status == 0x54 || d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
+      d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
+    {
+      g_message ("[focaltech_6658] *** Finger touch DETECTED! (st=0x%02X, deltas=[%d, %d, %d, %d]) ***",
+                 self->last_status, d0, d1, d2, d3);
+      fpi_ssm_mark_completed (transfer->ssm);
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+      return;
     }
 
   fpi_ssm_jump_to_state (transfer->ssm, FDT_STATE_WAIT_POLL);
@@ -218,20 +236,37 @@ fdt_ssm_state (FpiSsm *ssm, FpDevice *dev)
       fpi_ssm_next_state_delayed (ssm, FDT_INTEGRATION_MS);
       break;
 
-    case FDT_STATE_READ_CMD:
+    case FDT_STATE_READ_STATUS:
       {
-        static const guint8 pkt[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+        static const guint8 read_st_cmd[] = { 0x08, 0xF7, 0x80, 0x00, 0x00 };
+        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_st_cmd, 5), 5, g_free);
+        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fpi_ssm_usb_transfer_cb, NULL);
+
+        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
+        rx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 1);
+        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fdt_status_cb, NULL);
       }
       break;
 
-    case FDT_STATE_READ_DATA:
+    case FDT_STATE_READ_DELTAS:
       {
+        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_deltas_cmd, 6), 6, g_free);
+        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fpi_ssm_usb_transfer_cb, NULL);
+
         FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
         rx->ssm = ssm;
         fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 8);
         fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 fdt_read_cb, NULL);
+                                 fdt_deltas_cb, NULL);
       }
       break;
     }
@@ -425,7 +460,7 @@ capture_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 /* ========================================================================= */
 
 static void
-finger_off_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+finger_off_deltas_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
@@ -436,21 +471,22 @@ finger_off_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
       return;
     }
 
+  guint16 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
   if (transfer->actual_length >= 8)
     {
-      guint16 d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
-      guint16 d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
-      guint16 d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
-      guint16 d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+      d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
+      d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
+      d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
+      d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+    }
 
-      if (d0 < FDT_RELEASE_THRESHOLD && d1 < FDT_RELEASE_THRESHOLD &&
-          d2 < FDT_RELEASE_THRESHOLD && d3 < FDT_RELEASE_THRESHOLD)
-        {
-          g_message ("[focaltech_6658] Finger lifted ([%d, %d, %d, %d])", d0, d1, d2, d3);
-          fpi_ssm_mark_completed (transfer->ssm);
-          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
-          return;
-        }
+  if (d0 < FDT_RELEASE_THRESHOLD && d1 < FDT_RELEASE_THRESHOLD &&
+      d2 < FDT_RELEASE_THRESHOLD && d3 < FDT_RELEASE_THRESHOLD)
+    {
+      g_message ("[focaltech_6658] Finger lifted ([%d, %d, %d, %d])", d0, d1, d2, d3);
+      fpi_ssm_mark_completed (transfer->ssm);
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+      return;
     }
 
   fpi_ssm_jump_to_state (transfer->ssm, OFF_STATE_WAIT_POLL);
@@ -484,20 +520,20 @@ finger_off_ssm_state (FpiSsm *ssm, FpDevice *dev)
       fpi_ssm_next_state_delayed (ssm, FDT_INTEGRATION_MS);
       break;
 
-    case OFF_STATE_READ_CMD:
+    case OFF_STATE_READ_DELTAS:
       {
-        static const guint8 pkt[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
+        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_deltas_cmd, 6), 6, g_free);
+        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fpi_ssm_usb_transfer_cb, NULL);
 
-    case OFF_STATE_READ_DATA:
-      {
         FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
         rx->ssm = ssm;
         fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 8);
         fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 finger_off_read_cb, NULL);
+                                 finger_off_deltas_cb, NULL);
       }
       break;
     }
