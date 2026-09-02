@@ -34,9 +34,10 @@
 #define IMAGE_HEIGHT   (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM    ((508.0 * SCALE_FACTOR) / 25.4)
 
-#define FDT_TOUCH_THRESHOLD 50
+#define FDT_TOUCH_THRESHOLD   50
 #define FDT_RELEASE_THRESHOLD 25
-#define FDT_POLL_DELAY_MS   60
+#define FDT_INTEGRATION_MS    10
+#define FDT_POLL_DELAY_MS     50
 
 /* USB command packets */
 static const guint8 cmd_fdt_sense[] = { 0xC2, 0x3D, 0x00 };
@@ -48,6 +49,7 @@ enum {
   FDT_STATE_ENABLE,
   FDT_STATE_WAIT_POLL,
   FDT_STATE_SENSE,
+  FDT_STATE_WAIT_INTEGRATE,
   FDT_STATE_READ_CMD,
   FDT_STATE_READ_DATA,
   FDT_NUM_STATES,
@@ -67,6 +69,7 @@ enum {
 enum {
   OFF_STATE_WAIT_POLL,
   OFF_STATE_SENSE,
+  OFF_STATE_WAIT_INTEGRATE,
   OFF_STATE_READ_CMD,
   OFF_STATE_READ_DATA,
   OFF_NUM_STATES,
@@ -183,6 +186,10 @@ fdt_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
     case FDT_STATE_SENSE:
       ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      break;
+
+    case FDT_STATE_WAIT_INTEGRATE:
+      fpi_ssm_next_state_delayed (ssm, FDT_INTEGRATION_MS);
       break;
 
     case FDT_STATE_READ_CMD:
@@ -413,6 +420,10 @@ finger_off_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
     case OFF_STATE_SENSE:
       ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      break;
+
+    case OFF_STATE_WAIT_INTEGRATE:
+      fpi_ssm_next_state_delayed (ssm, FDT_INTEGRATION_MS);
       break;
 
     case OFF_STATE_READ_CMD:
