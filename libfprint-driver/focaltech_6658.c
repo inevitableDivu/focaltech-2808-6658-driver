@@ -28,6 +28,8 @@
 #define SENSOR_PIXELS  (SENSOR_WIDTH * SENSOR_HEIGHT)
 #define SENSOR_RAW_LEN (SENSOR_PIXELS * 2)
 
+#define SENSOR_PPMM    (508.0 / 25.4) /* 508 DPI standard */
+
 #define FDT_TOUCH_THRESHOLD 50
 #define FDT_POLL_DELAY_MS   60
 
@@ -39,6 +41,7 @@ static const guint8 cmd_scan_img[]  = { 0xC4, 0x3B, 0x00 };
 enum {
   M_INIT_AFE,
   M_FDT_ENABLE,
+  M_WAIT_POLL,
   M_FDT_SENSE,
   M_FDT_READ_CMD,
   M_FDT_READ_DATA,
@@ -117,8 +120,8 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
         }
     }
 
-  /* No touch yet, poll again using SSM delayed transition */
-  fpi_ssm_jump_to_state_delayed (transfer->ssm, M_FDT_SENSE, FDT_POLL_DELAY_MS);
+  /* No touch yet, jump to wait poll state */
+  fpi_ssm_jump_to_state (transfer->ssm, M_WAIT_POLL);
 }
 
 static void
@@ -177,6 +180,10 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         static const guint8 fdt_on_pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
         ft_send_bulk_cmd (self, fdt_on_pkt, sizeof (fdt_on_pkt));
       }
+      break;
+
+    case M_WAIT_POLL:
+      fpi_ssm_next_state_delayed (ssm, FDT_POLL_DELAY_MS);
       break;
 
     case M_FDT_SENSE:
@@ -247,7 +254,8 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
     case M_CAPTURE_PROCESS:
       {
         FpImage *img = fp_image_new (SENSOR_WIDTH, SENSOR_HEIGHT);
-        img->flags |= FPI_IMAGE_COLORS_INVERTED;
+        img->ppmm = SENSOR_PPMM;
+        img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL;
 
         guint16 *pixels = g_malloc (SENSOR_PIXELS * sizeof (guint16));
         guint16 *sorted = g_malloc (SENSOR_PIXELS * sizeof (guint16));
@@ -276,7 +284,8 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
           }
         g_free (pixels);
 
-        fp_dbg ("Frame contrast-normalized: p_low=%d, p_high=%d, range=%d", p_low, p_high, range);
+        fp_dbg ("Frame contrast-normalized: p_low=%d, p_high=%d, range=%d, ppmm=%.2f",
+                p_low, p_high, range, img->ppmm);
         fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
         fpi_ssm_mark_completed (ssm);
         fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
