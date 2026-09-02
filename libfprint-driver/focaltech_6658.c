@@ -37,6 +37,7 @@
 #define TOUCH_DIFF_THRESHOLD   75
 #define TOUCH_MIN_SENSELS      15
 #define TOUCH_REQUIRED_STREAK  2
+#define MIN_DYNAMIC_RANGE      200
 #define POLL_INTERVAL_MS       60
 #define BASELINE_WARMUP_CYCLES 3
 
@@ -277,12 +278,6 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
         if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
           {
-            g_message ("[focaltech_6658] *** VERIFIED PHYSICAL FINGER TOUCH DETECTED! (streak=%u, sensels=%u) ***",
-                       self->touch_streak, touch_count);
-
-            self->touch_streak = 0;
-            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
-
             /* Contrast stretch raw matrix across active range (2nd to 98th percentile) */
             guint16 *sorted = g_memdup2 (cur_pixels, RAW_PIXELS * sizeof (guint16));
             qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
@@ -291,6 +286,23 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
             g_free (sorted);
 
             guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
+
+            /* Quality / Dynamic Range Gate: Reject flat noise or low contrast frames */
+            if (range < MIN_DYNAMIC_RANGE)
+              {
+                g_message ("[focaltech_6658] Frame rejected (low dynamic range=%u < %u). Re-polling...",
+                           range, MIN_DYNAMIC_RANGE);
+                g_free (cur_pixels);
+                fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
+                return;
+              }
+
+            g_message ("[focaltech_6658] *** VERIFIED PHYSICAL FINGER TOUCH DETECTED! (streak=%u, sensels=%u, range=%u) ***",
+                       self->touch_streak, touch_count, range);
+
+            self->touch_streak = 0;
+            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+
             guint8 *raw_norm = g_malloc (RAW_PIXELS);
             for (int i = 0; i < RAW_PIXELS; i++)
               {
