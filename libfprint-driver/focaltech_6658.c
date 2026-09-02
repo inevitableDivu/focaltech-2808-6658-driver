@@ -29,12 +29,11 @@
 #define SENSOR_RAW_LEN (SENSOR_PIXELS * 2)
 
 #define FDT_TOUCH_THRESHOLD 50
+#define FDT_POLL_DELAY_MS   60
 
 /* USB command packets */
 static const guint8 cmd_fdt_sense[] = { 0xC2, 0x3D, 0x00 };
 static const guint8 cmd_scan_img[]  = { 0xC4, 0x3B, 0x00 };
-static const guint8 cmd_afe_wake[]  = { 0x5A, 0xA5, 0x00 };
-static const guint8 cmd_afe_lock[]  = { 0xA5, 0x5A, 0x00 };
 
 /* SSM loop states */
 enum {
@@ -110,9 +109,8 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
         }
     }
 
-  /* No touch yet, poll again after brief delay */
-  g_usleep (80000);
-  fpi_ssm_jump_to_state (transfer->ssm, M_FDT_SENSE);
+  /* No touch yet, poll again using SSM delayed transition */
+  fpi_ssm_jump_to_state_delayed (transfer->ssm, M_FDT_SENSE, FDT_POLL_DELAY_MS);
 }
 
 static void
@@ -211,8 +209,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case M_CAPTURE_WAIT:
-      g_usleep (40000); /* 40ms capture delay */
-      fpi_ssm_next_state (ssm);
+      fpi_ssm_next_state_delayed (ssm, 40); /* 40ms capture delay asynchronously */
       break;
 
     case M_CAPTURE_READ_CHUNK:
@@ -264,9 +261,8 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
         fp_dbg ("Frame processed: min=%d, max=%d, range=%d", min_v, max_v, range);
         fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
-        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
-
         fpi_ssm_mark_completed (ssm);
+        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
       }
       break;
     }
@@ -278,6 +274,10 @@ focaltech_loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
   self->ssm = NULL;
+  if (self->deactivating)
+    fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (self), error);
+  else if (error != NULL)
+    fpi_image_device_session_error (FP_IMAGE_DEVICE (self), error);
 }
 
 /* Open sequence */
@@ -330,8 +330,14 @@ focaltech_dev_deactivate (FpImageDevice *dev)
 
   self->deactivating = TRUE;
   if (self->ssm)
-    fpi_ssm_mark_completed (self->ssm);
-  fpi_image_device_deactivate_complete (dev, NULL);
+    {
+      fpi_ssm_cancel_delayed_state_change (self->ssm);
+      fpi_ssm_mark_completed (self->ssm);
+    }
+  else
+    {
+      fpi_image_device_deactivate_complete (dev, NULL);
+    }
 }
 
 /* Change state */
@@ -379,5 +385,5 @@ fpi_device_focaltech_6658_class_init (FpiDeviceFocaltech6658Class *klass)
 
   img_class->img_width = SENSOR_WIDTH;
   img_class->img_height = SENSOR_HEIGHT;
-  img_class->bz3_threshold = 20;
+  img_class->bz3_threshold = 15;
 }
