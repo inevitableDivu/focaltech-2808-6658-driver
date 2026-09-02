@@ -101,6 +101,12 @@ ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 }
 
 static void
+dummy_tx_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  /* OUT command sent; IN transfer handles state completion */
+}
+
+static void
 fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
@@ -230,7 +236,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         tx->short_is_error = TRUE;
         fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_deltas_cmd, 6), 6, g_free);
         fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 NULL, NULL); /* No-op on TX, RX handles completion */
+                                 dummy_tx_cb, NULL);
 
         FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
         rx->ssm = ssm;
@@ -303,7 +309,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         tx->short_is_error = TRUE;
         fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (sram_cmd, 6), 6, g_free);
         fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 NULL, NULL);
+                                 dummy_tx_cb, NULL);
 
         FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
         rx->ssm = ssm;
