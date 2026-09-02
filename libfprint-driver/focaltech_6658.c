@@ -32,9 +32,9 @@
 #define SCALE_FACTOR    2
 #define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
-#define SENSOR_PPMM     ((508.0 * SCALE_FACTOR) / 25.4)
+#define SENSOR_PPMM     (500.0 / 25.4) /* Standard 500 DPI for NIST NBIS */
 
-#define TOUCH_DIFF_THRESHOLD 40
+#define TOUCH_DIFF_THRESHOLD 25
 #define POLL_INTERVAL_MS     60
 
 /* State machine states */
@@ -75,14 +75,6 @@ static const FpIdEntry id_table[] = {
   { .vid = 0, .pid = 0, .driver_data = 0 }
 };
 
-static int
-compare_u16 (const void *a, const void *b)
-{
-  guint16 arg1 = *(const guint16 *) a;
-  guint16 arg2 = *(const guint16 *) b;
-  return (arg1 > arg2) - (arg1 < arg2);
-}
-
 static void
 ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 {
@@ -107,7 +99,8 @@ read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GErr
 
   if (error)
     {
-      g_warning ("[focaltech_6658] Read chunk error: %s", error->message);
+      if (!self->deactivating)
+        g_warning ("[focaltech_6658] Read chunk error: %s", error->message);
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
@@ -168,7 +161,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
     case M_INIT_CFG_1800:
       {
         static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F };
-        g_message ("[focaltech_6658] Continuous matrix scanning initialized");
+        g_message ("[focaltech_6658] Continuous matrix scanning active");
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
@@ -229,9 +222,11 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
             return;
           }
 
-        /* Calculate max delta across valid pixels */
+        /* Calculate delta image and find max touch deflection */
+        guint16 *delta = g_malloc0 (RAW_PIXELS * sizeof (guint16));
         guint16 max_diff = 0;
         guint touch_count = 0;
+
         for (int i = 0; i < RAW_PIXELS; i++)
           {
             guint16 b = self->baseline_buf[i];
@@ -239,6 +234,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
             if (b < 60000 && c < 60000)
               {
                 guint16 diff = (c > b) ? (c - b) : (b - c);
+                delta[i] = diff;
                 if (diff > max_diff) max_diff = diff;
                 if (diff > 15) touch_count++;
               }
@@ -258,28 +254,22 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
             fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
 
-            /* Contrast stretch and upscale */
+            /* Create NIST-optimized image */
             FpImage *img = fp_image_new (IMAGE_WIDTH, IMAGE_HEIGHT);
             img->ppmm = SENSOR_PPMM;
-            img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL;
+            img->flags = FPI_IMAGE_COLORS_INVERTED;
 
-            guint16 *sorted = g_memdup2 (cur_pixels, RAW_PIXELS * sizeof (guint16));
-            qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
-            guint16 p_low  = sorted[(RAW_PIXELS * 2) / 100];
-            guint16 p_high = sorted[(RAW_PIXELS * 98) / 100];
-            g_free (sorted);
-
-            guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
             guint8 *raw_norm = g_malloc (RAW_PIXELS);
+            guint32 range = (max_diff > 0) ? max_diff : 1;
+
             for (int i = 0; i < RAW_PIXELS; i++)
               {
-                guint16 px = cur_pixels[i];
-                if (px < p_low) px = p_low;
-                if (px > p_high) px = p_high;
-                raw_norm[i] = (guint8)(((guint32)(px - p_low) * 255) / range);
+                guint32 val = ((guint32) delta[i] * 255) / range;
+                if (val > 255) val = 255;
+                raw_norm[i] = (guint8) val;
               }
 
-            /* 2x Bilinear upscaling to 128x160 for optimal NIST mindtct feature extraction */
+            /* Bilinear upsample 2x to 128x160 with smooth interpolation */
             for (int y = 0; y < IMAGE_HEIGHT; y++)
               {
                 int src_y = y / SCALE_FACTOR;
@@ -289,11 +279,13 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
                     img->data[y * IMAGE_WIDTH + x] = raw_norm[src_y * RAW_WIDTH + src_x];
                   }
               }
+
             g_free (raw_norm);
+            g_free (delta);
             g_free (cur_pixels);
 
-            g_message ("[focaltech_6658] Frame captured & normalized: p2=%d, p98=%d, range=%d, dim=%dx%d",
-                       p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT);
+            g_message ("[focaltech_6658] Clean subtracted frame delivered to mindtct: max_delta=%d, dim=%dx%d, ppmm=%.2f",
+                       max_diff, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
 
             fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
             fpi_ssm_mark_completed (ssm);
@@ -301,6 +293,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
             return;
           }
 
+        g_free (delta);
         g_free (cur_pixels);
         fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
       }
@@ -435,5 +428,5 @@ fpi_device_focaltech_6658_class_init (FpiDeviceFocaltech6658Class *klass)
 
   img_class->img_width = IMAGE_WIDTH;
   img_class->img_height = IMAGE_HEIGHT;
-  img_class->bz3_threshold = 12;
+  img_class->bz3_threshold = 24;
 }
