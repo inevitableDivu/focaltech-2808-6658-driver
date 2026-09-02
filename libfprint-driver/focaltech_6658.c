@@ -27,6 +27,7 @@
 #define RAW_HEIGHT     80
 #define RAW_PIXELS     (RAW_WIDTH * RAW_HEIGHT)
 #define RAW_BUF_SIZE   (RAW_PIXELS * 2)
+#define SRAM_FRAME_BASE 0x0200
 
 #define SCALE_FACTOR   2
 #define IMAGE_WIDTH    (RAW_WIDTH * SCALE_FACTOR)
@@ -211,7 +212,7 @@ fdt_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 }
 
 /* ========================================================================= */
-/* Phase 2: Frame Capture & Normalization SSM                                */
+/* Phase 2: Frame Capture & Normalization SSM (Reading from 0x0200)          */
 /* ========================================================================= */
 
 static void
@@ -254,7 +255,9 @@ capture_ssm_state (FpiSsm *ssm, FpDevice *dev)
       {
         static const guint8 prep_pkt[] = {
           0x09, 0xF6, 0x9A, 0x00,
-          0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xF8,
+          0x5A, 0xA5, 0x00,
+          0xA5, 0x5A, 0x00,
+          0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC,
           0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F,
         };
         ft_send_bulk_cmd (self, prep_pkt, sizeof (prep_pkt));
@@ -272,7 +275,7 @@ capture_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
     case CAP_STATE_READ_CHUNK:
       {
-        guint16 cur_addr = self->read_offset;
+        guint16 cur_addr = SRAM_FRAME_BASE + self->read_offset;
         guint8 sram_cmd[6] = {
           0x04, 0xFB,
           (guint8)(((cur_addr >> 8) | 0x80) & 0xFF),
@@ -339,7 +342,7 @@ capture_ssm_state (FpiSsm *ssm, FpDevice *dev)
           }
         g_free (raw_norm);
 
-        fp_dbg ("Captured frame: p_low=%d, p_high=%d, range=%d, dim=%dx%d, ppmm=%.2f",
+        fp_dbg ("Captured frame from 0x0200: p_low=%d, p_high=%d, range=%d, dim=%dx%d, ppmm=%.2f",
                 p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
 
         fpi_ssm_mark_completed (ssm);
