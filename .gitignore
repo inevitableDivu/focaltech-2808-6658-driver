@@ -27,3 +27,12 @@ build/
 builddir/
 subprojects/
 libfprint-source/
+
+# Arch Linux makepkg artifacts
+*.pkg.tar.zst
+*.pkg.tar.xz
+src/
+pkg/
+libfprint-driver/src/
+libfprint-driver/pkg/
+libfprint-driver/libfprint/

@@ -37,25 +37,12 @@ static const guint8 cmd_scan_img[]  = { 0xC4, 0x3B, 0x00 };
 static const guint8 cmd_afe_wake[]  = { 0x5A, 0xA5, 0x00 };
 static const guint8 cmd_afe_lock[]  = { 0xA5, 0x5A, 0x00 };
 
-/* Loop SSM states */
-enum {
-  STATE_FDT_SENSE,
-  STATE_FDT_READ_DELTAS,
-  STATE_CAPTURE_START,
-  STATE_CAPTURE_WAIT,
-  STATE_CAPTURE_READ_SRAM,
-  STATE_FINGER_OFF_POLL,
-  NUM_STATES,
-};
-
 struct _FpiDeviceFocaltech6658
 {
   FpImageDevice parent;
-  FpiSsm       *ssm;
   guint8       *frame_buf;
   gboolean      deactivating;
-  GCancellable *cancellable;
-  GSource      *poll_timer;
+  guint         poll_timer_id;
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceFocaltech6658, fpi_device_focaltech_6658, FPI, DEVICE_FOCALTECH_6658, FpImageDevice);
@@ -151,6 +138,8 @@ focaltech_dev_close (FpImageDevice *dev)
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   GError *error = NULL;
 
+  g_clear_handle_id (&self->poll_timer_id, g_source_remove);
+
   ft_send_cmd_sync (self, cmd_reset, sizeof (cmd_reset));
   g_free (self->frame_buf);
   self->frame_buf = NULL;
@@ -178,11 +167,7 @@ focaltech_dev_deactivate (FpImageDevice *dev)
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
   self->deactivating = TRUE;
-  if (self->poll_timer)
-    {
-      g_source_destroy (self->poll_timer);
-      self->poll_timer = NULL;
-    }
+  g_clear_handle_id (&self->poll_timer_id, g_source_remove);
 
   ft_write_reg_sync (self, 0x9A, 0x00); /* Disable FDT mode */
   fpi_image_device_deactivate_complete (dev, NULL);
@@ -237,7 +222,7 @@ poll_finger_touch (gpointer user_data)
               d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
             {
               fp_dbg ("Finger touch detected: [%d, %d, %d, %d]", d0, d1, d2, d3);
-              self->poll_timer = NULL;
+              self->poll_timer_id = 0;
               fpi_image_device_report_finger_status (dev, TRUE);
               return G_SOURCE_REMOVE;
             }
@@ -257,12 +242,17 @@ focaltech_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
   switch (state)
     {
+    case FPI_IMAGE_DEVICE_STATE_IDLE:
+    case FPI_IMAGE_DEVICE_STATE_ACTIVATING:
+    case FPI_IMAGE_DEVICE_STATE_DEACTIVATING:
+    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
+      g_clear_handle_id (&self->poll_timer_id, g_source_remove);
+      break;
+
     case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
       ft_write_reg_sync (self, 0x9A, 0x5A); /* Enable FDT */
-      if (!self->poll_timer)
-        self->poll_timer = g_timeout_source_new (100);
-      g_source_set_callback (self->poll_timer, poll_finger_touch, dev, NULL);
-      g_source_attach (self->poll_timer, fpi_device_get_main_context (FP_DEVICE (dev)));
+      if (!self->poll_timer_id)
+        self->poll_timer_id = g_timeout_add (100, poll_finger_touch, dev);
       break;
 
     case FPI_IMAGE_DEVICE_STATE_CAPTURE:
@@ -338,10 +328,6 @@ focaltech_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
     case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
       fpi_image_device_report_finger_status (dev, FALSE);
-      break;
-
-    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
-    default:
       break;
     }
 }
