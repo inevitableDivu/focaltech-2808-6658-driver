@@ -31,18 +31,37 @@
 #define FDT_TOUCH_THRESHOLD 50
 
 /* USB command packets */
-static const guint8 cmd_reset[]     = { 0xC0, 0x3F, 0x00 };
 static const guint8 cmd_fdt_sense[] = { 0xC2, 0x3D, 0x00 };
 static const guint8 cmd_scan_img[]  = { 0xC4, 0x3B, 0x00 };
 static const guint8 cmd_afe_wake[]  = { 0x5A, 0xA5, 0x00 };
 static const guint8 cmd_afe_lock[]  = { 0xA5, 0x5A, 0x00 };
 
+/* SSM states */
+enum {
+  M_INIT_RESET,
+  M_INIT_AFE_WAKE,
+  M_INIT_AFE_LOCK,
+  M_FDT_ENABLE,
+  M_FDT_SENSE,
+  M_FDT_READ_CMD,
+  M_FDT_READ_DATA,
+  M_CAPTURE_PREPARE,
+  M_CAPTURE_START,
+  M_CAPTURE_WAIT,
+  M_CAPTURE_READ_CHUNK,
+  M_CAPTURE_PROCESS,
+  M_WAIT_FINGER_OFF_SENSE,
+  M_WAIT_FINGER_OFF_READ,
+  M_NUM_STATES,
+};
+
 struct _FpiDeviceFocaltech6658
 {
   FpImageDevice parent;
+  FpiSsm       *ssm;
   guint8       *frame_buf;
+  gsize         read_offset;
   gboolean      deactivating;
-  guint         poll_timer_id;
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceFocaltech6658, fpi_device_focaltech_6658, FPI, DEVICE_FOCALTECH_6658, FpImageDevice);
@@ -57,253 +76,216 @@ static const FpIdEntry id_table[] = {
 };
 
 static void
-ft_write_reg_sync (FpiDeviceFocaltech6658 *self, guint8 reg, guint8 val)
+ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 {
-  FpiUsbTransfer *transfer;
-  guint8 *buf = g_malloc (4);
-
-  buf[0] = 0x09;
-  buf[1] = 0xF6;
-  buf[2] = reg;
-  buf[3] = val;
-
-  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-  fpi_usb_transfer_fill_bulk_full (transfer, FT_EP_OUT, buf, 4, g_free);
-  fpi_usb_transfer_submit_sync (transfer, 1000, NULL);
+  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
+  transfer->ssm = self->ssm;
+  transfer->short_is_error = TRUE;
+  fpi_usb_transfer_fill_bulk_full (transfer, FT_EP_OUT, g_memdup2 (cmd, len), len, g_free);
+  fpi_usb_transfer_submit (transfer, 1000, fpi_device_get_cancellable (FP_DEVICE (self)),
+                           fpi_ssm_usb_transfer_cb, NULL);
 }
 
 static void
-ft_write_16bit_sync (FpiDeviceFocaltech6658 *self, guint16 addr, guint16 val)
-{
-  FpiUsbTransfer *transfer;
-  guint8 *buf = g_malloc (8);
-
-  buf[0] = 0x05;
-  buf[1] = 0xFA;
-  buf[2] = ((addr >> 8) | 0x80) & 0xFF;
-  buf[3] = addr & 0xFF;
-  buf[4] = 0x00;
-  buf[5] = 0x01;
-  buf[6] = val & 0xFF;
-  buf[7] = (val >> 8) & 0xFF;
-
-  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-  fpi_usb_transfer_fill_bulk_full (transfer, FT_EP_OUT, buf, 8, g_free);
-  fpi_usb_transfer_submit_sync (transfer, 1000, NULL);
-}
-
-static void
-ft_send_cmd_sync (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
-{
-  FpiUsbTransfer *transfer;
-
-  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-  fpi_usb_transfer_fill_bulk (transfer, FT_EP_OUT, len);
-  memcpy (transfer->buffer, cmd, len);
-  fpi_usb_transfer_submit_sync (transfer, 1000, NULL);
-}
-
-/* Open sequence */
-static void
-focaltech_dev_open (FpImageDevice *dev)
+fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-  GError *error = NULL;
 
-  g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
   if (error)
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
 
-  self->frame_buf = g_malloc0 (SENSOR_RAW_LEN);
-
-  /* Initialize AFE and hardware registers */
-  ft_write_reg_sync (self, 0xC6, 0x00);
-  g_usleep (10000);
-  ft_send_cmd_sync (self, cmd_afe_wake, sizeof (cmd_afe_wake));
-  g_usleep (10000);
-  ft_send_cmd_sync (self, cmd_afe_lock, sizeof (cmd_afe_lock));
-  g_usleep (10000);
-
-  fp_dbg ("FocalTech 2808:6658 initialized successfully");
-  fpi_image_device_open_complete (dev, NULL);
-}
-
-/* Close sequence */
-static void
-focaltech_dev_close (FpImageDevice *dev)
-{
-  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-  GError *error = NULL;
-
-  g_clear_handle_id (&self->poll_timer_id, g_source_remove);
-
-  ft_send_cmd_sync (self, cmd_reset, sizeof (cmd_reset));
-  g_free (self->frame_buf);
-  self->frame_buf = NULL;
-
-  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
-  fpi_image_device_close_complete (dev, error);
-}
-
-/* Activate */
-static void
-focaltech_dev_activate (FpImageDevice *dev)
-{
-  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-
-  self->deactivating = FALSE;
-  ft_write_reg_sync (self, 0x9A, 0x5A); /* Enable FDT mode */
-
-  fpi_image_device_activate_complete (dev, NULL);
-}
-
-/* Deactivate */
-static void
-focaltech_dev_deactivate (FpImageDevice *dev)
-{
-  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-
-  self->deactivating = TRUE;
-  g_clear_handle_id (&self->poll_timer_id, g_source_remove);
-
-  ft_write_reg_sync (self, 0x9A, 0x00); /* Disable FDT mode */
-  fpi_image_device_deactivate_complete (dev, NULL);
-}
-
-/* Capture / State handler */
-static gboolean
-poll_finger_touch (gpointer user_data)
-{
-  FpImageDevice *dev = FP_IMAGE_DEVICE (user_data);
-  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-  FpiUsbTransfer *transfer;
-  guint8 *sram_cmd;
-  GError *error = NULL;
-
-  if (self->deactivating)
-    return G_SOURCE_REMOVE;
-
-  /* Trigger FDT Sense */
-  ft_send_cmd_sync (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
-  g_usleep (5000);
-
-  /* Read 8 bytes from SRAM 0x00E8 (Touch Deltas) */
-  sram_cmd = g_malloc (6);
-  sram_cmd[0] = 0x04;
-  sram_cmd[1] = 0xFB;
-  sram_cmd[2] = 0x80;
-  sram_cmd[3] = 0xE8;
-  sram_cmd[4] = 0x00;
-  sram_cmd[5] = 0x04; /* 4 words = 8 bytes */
-
-  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-  fpi_usb_transfer_fill_bulk_full (transfer, FT_EP_OUT, sram_cmd, 6, g_free);
-  fpi_usb_transfer_submit_sync (transfer, 500, &error);
-
-  if (!error)
+  if (transfer->actual_length >= 8)
     {
-      guint8 deltas_buf[8] = { 0 };
-      transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-      fpi_usb_transfer_fill_bulk (transfer, FT_EP_IN, 8);
-      fpi_usb_transfer_submit_sync (transfer, 500, &error);
+      guint16 d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
+      guint16 d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
+      guint16 d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
+      guint16 d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
 
-      if (!error && transfer->actual_length == 8)
+      if (d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
+          d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
         {
-          memcpy (deltas_buf, transfer->buffer, 8);
-          guint16 d0 = (deltas_buf[0] << 8) | deltas_buf[1];
-          guint16 d1 = (deltas_buf[2] << 8) | deltas_buf[3];
-          guint16 d2 = (deltas_buf[4] << 8) | deltas_buf[5];
-          guint16 d3 = (deltas_buf[6] << 8) | deltas_buf[7];
-
-          if (d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
-              d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
-            {
-              fp_dbg ("Finger touch detected: [%d, %d, %d, %d]", d0, d1, d2, d3);
-              self->poll_timer_id = 0;
-              fpi_image_device_report_finger_status (dev, TRUE);
-              return G_SOURCE_REMOVE;
-            }
+          fp_dbg ("Finger touch detected: [%d, %d, %d, %d]", d0, d1, d2, d3);
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+          fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_PREPARE);
+          return;
         }
     }
 
-  return G_SOURCE_CONTINUE;
+  /* No touch yet, loop FDT sense */
+  g_usleep (100000); /* 100ms interval */
+  fpi_ssm_jump_to_state (transfer->ssm, M_FDT_SENSE);
 }
 
 static void
-focaltech_change_state (FpImageDevice *dev, FpiImageDeviceState state)
+finger_off_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (transfer->actual_length >= 8)
+    {
+      guint16 d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
+      guint16 d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
+      guint16 d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
+      guint16 d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+
+      if (d0 < 30 && d1 < 30 && d2 < 30 && d3 < 30)
+        {
+          fp_dbg ("Finger removed: [%d, %d, %d, %d]", d0, d1, d2, d3);
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+          fpi_ssm_jump_to_state (transfer->ssm, M_FDT_ENABLE);
+          return;
+        }
+    }
+
+  /* Still touching, keep waiting */
+  g_usleep (100000);
+  fpi_ssm_jump_to_state (transfer->ssm, M_WAIT_FINGER_OFF_SENSE);
+}
+
+static void
+capture_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (transfer->actual_length > 0)
+    {
+      memcpy (self->frame_buf + self->read_offset, transfer->buffer, transfer->actual_length);
+      self->read_offset += transfer->actual_length;
+    }
+
+  if (self->read_offset >= SENSOR_RAW_LEN)
+    {
+      fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_PROCESS);
+    }
+  else
+    {
+      fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_READ_CHUNK);
+    }
+}
+
+static void
+focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
   if (self->deactivating)
-    return;
-
-  switch (state)
     {
-    case FPI_IMAGE_DEVICE_STATE_IDLE:
-    case FPI_IMAGE_DEVICE_STATE_ACTIVATING:
-    case FPI_IMAGE_DEVICE_STATE_DEACTIVATING:
-    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
-      g_clear_handle_id (&self->poll_timer_id, g_source_remove);
-      break;
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
 
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
-      ft_write_reg_sync (self, 0x9A, 0x5A); /* Enable FDT */
-      if (!self->poll_timer_id)
-        self->poll_timer_id = g_timeout_add (100, poll_finger_touch, dev);
-      break;
-
-    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case M_INIT_RESET:
       {
-        ft_write_reg_sync (self, 0x9A, 0x00); /* Disable FDT */
-        ft_write_16bit_sync (self, 0x1801, 0xFCA7);
-        ft_write_16bit_sync (self, 0x1800, 0x4FFE);
-        g_usleep (5000);
+        static const guint8 reset_pkt[] = { 0x09, 0xF6, 0xC6, 0x00 };
+        ft_send_bulk_cmd (self, reset_pkt, sizeof (reset_pkt));
+      }
+      break;
 
-        /* Trigger Image Scan */
-        ft_send_cmd_sync (self, cmd_scan_img, sizeof (cmd_scan_img));
-        g_usleep (40000);
+    case M_INIT_AFE_WAKE:
+      ft_send_bulk_cmd (self, cmd_afe_wake, sizeof (cmd_afe_wake));
+      break;
 
-        /* Read 10,240 bytes from SRAM 0x0000 in 512-byte chunks */
-        gsize offset = 0;
-        while (offset < SENSOR_RAW_LEN)
-          {
-            guint16 cur_addr = offset;
-            guint8 sram_cmd[6];
-            sram_cmd[0] = 0x04;
-            sram_cmd[1] = 0xFB;
-            sram_cmd[2] = ((cur_addr >> 8) | 0x80) & 0xFF;
-            sram_cmd[3] = cur_addr & 0xFF;
-            sram_cmd[4] = 0x01; /* 256 words = 512 bytes */
-            sram_cmd[5] = 0x00;
+    case M_INIT_AFE_LOCK:
+      ft_send_bulk_cmd (self, cmd_afe_lock, sizeof (cmd_afe_lock));
+      break;
 
-            FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
-            fpi_usb_transfer_fill_bulk (tx, FT_EP_OUT, 6);
-            memcpy (tx->buffer, sram_cmd, 6);
-            fpi_usb_transfer_submit_sync (tx, 500, NULL);
+    case M_FDT_ENABLE:
+      {
+        static const guint8 fdt_on_pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
+        ft_send_bulk_cmd (self, fdt_on_pkt, sizeof (fdt_on_pkt));
+      }
+      break;
 
-            FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
-            fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 512);
-            fpi_usb_transfer_submit_sync (rx, 500, NULL);
-            if (rx->actual_length > 0)
-              {
-                memcpy (self->frame_buf + offset, rx->buffer, rx->actual_length);
-                offset += rx->actual_length;
-              }
-            else
-              {
-                break;
-              }
-          }
+    case M_FDT_SENSE:
+      ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      break;
 
-        /* Create FpImage and normalize 16-bit to 8-bit */
+    case M_FDT_READ_CMD:
+      {
+        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        ft_send_bulk_cmd (self, read_deltas_cmd, sizeof (read_deltas_cmd));
+      }
+      break;
+
+    case M_FDT_READ_DATA:
+      {
+        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
+        rx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 8);
+        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fdt_read_cb, NULL);
+      }
+      break;
+
+    case M_CAPTURE_PREPARE:
+      {
+        static const guint8 prep_pkt[] = {
+          0x09, 0xF6, 0x9A, 0x00,
+          0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC,
+          0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F,
+        };
+        ft_send_bulk_cmd (self, prep_pkt, sizeof (prep_pkt));
+      }
+      break;
+
+    case M_CAPTURE_START:
+      self->read_offset = 0;
+      ft_send_bulk_cmd (self, cmd_scan_img, sizeof (cmd_scan_img));
+      break;
+
+    case M_CAPTURE_WAIT:
+      g_usleep (40000); /* 40ms capture delay */
+      fpi_ssm_next_state (ssm);
+      break;
+
+    case M_CAPTURE_READ_CHUNK:
+      {
+        guint16 cur_addr = self->read_offset;
+        guint8 sram_cmd[6] = {
+          0x04, 0xFB,
+          (guint8)(((cur_addr >> 8) | 0x80) & 0xFF),
+          (guint8)(cur_addr & 0xFF),
+          0x01, 0x00 /* 256 words = 512 bytes */
+        };
+
+        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (sram_cmd, 6), 6, g_free);
+        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fpi_ssm_usb_transfer_cb, NULL);
+
+        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
+        rx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 512);
+        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 capture_chunk_cb, NULL);
+      }
+      break;
+
+    case M_CAPTURE_PROCESS:
+      {
         FpImage *img = fp_image_new (SENSOR_WIDTH, SENSOR_HEIGHT);
         img->flags |= FPI_IMAGE_COLORS_INVERTED;
 
         guint16 min_v = 65535, max_v = 0;
-        guint16 *pixels = (guint16 *) g_malloc (SENSOR_PIXELS * sizeof (guint16));
+        guint16 *pixels = g_malloc (SENSOR_PIXELS * sizeof (guint16));
 
         for (int i = 0; i < SENSOR_PIXELS; i++)
           {
@@ -321,15 +303,99 @@ focaltech_change_state (FpImageDevice *dev, FpiImageDeviceState state)
           }
         g_free (pixels);
 
-        fp_dbg ("Captured frame: min=%d, max=%d, range=%d", min_v, max_v, range);
-        fpi_image_device_image_captured (dev, img);
+        fp_dbg ("Frame processed: min=%d, max=%d, range=%d", min_v, max_v, range);
+        fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
+
+        /* Wait for finger to be lifted */
+        fpi_ssm_jump_to_state (ssm, M_WAIT_FINGER_OFF_SENSE);
       }
       break;
 
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
-      fpi_image_device_report_finger_status (dev, FALSE);
+    case M_WAIT_FINGER_OFF_SENSE:
+      ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      break;
+
+    case M_WAIT_FINGER_OFF_READ:
+      {
+        static const guint8 read_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        ft_send_bulk_cmd (self, read_cmd, sizeof (read_cmd));
+
+        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
+        rx->ssm = ssm;
+        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 8);
+        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 finger_off_read_cb, NULL);
+      }
       break;
     }
+}
+
+static void
+focaltech_loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  self->ssm = NULL;
+  if (self->deactivating)
+    fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (self), error);
+}
+
+/* Open sequence */
+static void
+focaltech_dev_open (FpImageDevice *dev)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+  GError *error = NULL;
+
+  g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
+  if (error)
+    {
+      fpi_image_device_open_complete (dev, error);
+      return;
+    }
+
+  self->frame_buf = g_malloc0 (SENSOR_RAW_LEN);
+  fpi_image_device_open_complete (dev, NULL);
+  fp_dbg ("FocalTech 2808:6658 device opened");
+}
+
+/* Close sequence */
+static void
+focaltech_dev_close (FpImageDevice *dev)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+  GError *error = NULL;
+
+  g_clear_pointer (&self->frame_buf, g_free);
+  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
+  fpi_image_device_close_complete (dev, error);
+  fp_dbg ("FocalTech 2808:6658 device closed");
+}
+
+/* Activate */
+static void
+focaltech_dev_activate (FpImageDevice *dev)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  self->deactivating = FALSE;
+  self->ssm = fpi_ssm_new (FP_DEVICE (self), focaltech_loop_state, M_NUM_STATES);
+  fpi_ssm_start (self->ssm, focaltech_loop_complete);
+
+  fpi_image_device_activate_complete (dev, NULL);
+}
+
+/* Deactivate */
+static void
+focaltech_dev_deactivate (FpImageDevice *dev)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  self->deactivating = TRUE;
+  if (self->ssm)
+    fpi_ssm_mark_completed (self->ssm);
+  else
+    fpi_image_device_deactivate_complete (dev, NULL);
 }
 
 static void
@@ -354,7 +420,6 @@ fpi_device_focaltech_6658_class_init (FpiDeviceFocaltech6658Class *klass)
   img_class->img_close = focaltech_dev_close;
   img_class->activate = focaltech_dev_activate;
   img_class->deactivate = focaltech_dev_deactivate;
-  img_class->change_state = focaltech_change_state;
 
   img_class->img_width = SENSOR_WIDTH;
   img_class->img_height = SENSOR_HEIGHT;
