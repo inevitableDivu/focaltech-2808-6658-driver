@@ -1,6 +1,6 @@
 # FocalTech FW9366 / Realtek USB Bridge (2808:6658) Protocol Specification
 
-This document details the reverse-engineered communication protocol for the **FocalTech FW9366** capacitive fingerprint sensor operating through the **Realtek USB 2.0 Bridge** (USB ID `2808:6658`).
+This document details the reverse-engineered communication protocol, register specifications, and architectural findings for the **FocalTech FW9366** capacitive fingerprint sensor operating through the **Realtek USB 2.0 Bridge** (USB ID `2808:6658`).
 
 ---
 
@@ -12,9 +12,9 @@ This document details the reverse-engineered communication protocol for the **Fo
 * **Endpoints:**
   * `0x01` (EP 1 OUT, Bulk, Max Packet Size 512 bytes): Host-to-Device command & write stream
   * `0x82` (EP 2 IN, Bulk, Max Packet Size 512 bytes): Device-to-Host response & sensor frame stream
-* **Sensor Geometry:** $80 \times 64$ pixels ($5,120$ pixels total)
+* **Sensor Geometry:** $80 \times 64$ pixels ($5,120$ sensels total, physical active area $\approx 3.2\text{ mm} \times 4.0\text{ mm}$)
 * **Pixel Bit Depth:** 16-bit unsigned (big-endian), raw frame size = $10,240\text{ bytes}$ ($0x2800$).
-* **Matching Architecture:** **Match-on-Host (Imaging Sensor)**. Minutiae extraction and matching is performed on the host CPU using standard open-source engines (e.g. NIST NBIS / Bozorth3).
+* **Matching Architecture:** **Match-on-Host (Imaging Sensor)**. Minutiae extraction and matching is performed on the host CPU.
 
 ---
 
@@ -80,31 +80,40 @@ Standard 3-byte command packets dispatched to the sensor:
 | `0xC6` (8-bit) | `RESET_REG` | Chip heartbeat / reset check register |
 | `0x1800` (16-bit) | `MODE_CTRL` | Mode control (`0x4FFE` = Image mode, `0x0000` = Idle) |
 | `0x1801` (16-bit) | `MODE_STATUS` | Configuration status register (`0xFCA7`) |
-| `0x00E8` (SRAM) | `FDT_DELTAS` | 4 $\times$ 16-bit capacitive touch delta values |
-| `0x0000`..`0x2800` (SRAM) | `IMAGE_BUFFER`| 10,240-byte active frame pixel buffer |
+| `0x00B8` (SRAM) | `FW9366_FDT_DELTAS`| 8 $\times$ 16-bit capacitive touch delta values (FW9366 chip default) |
+| `0x00E8` (SRAM) | `FW9391_FDT_DELTAS`| 4 $\times$ 16-bit capacitive touch delta values (FW9391 chip variant) |
+| `0x0000`..`0x01FF` (SRAM)| `CALIB_DATA` | 512-byte internal calibration registers & ADC mirrors |
+| `0x0200`..`0x29FF` (SRAM)| `FRAME_BUFFER` | $10,240$-byte raw capacitive matrix ($80 \times 64$ pixels) |
+| `0x1A05` (FIFO) | `SCAN_FIFO` | Streamed output of scanned matrix frame |
 
 ---
 
-## 5. Sensor Operational Sequences
+## 5. Operational Sequences
 
 ### 5.1. Initialization & AFE Wakeup
-1. Send `write_reg(0xC6, 0x00)` (Clear reset).
+1. Send `write_reg(0xC6, 0x00)` (Clear reset register).
 2. Send `send_cmd(9)` (`[0x5A, 0xA5, 0x00]`).
 3. Poll `read_reg(0x80)` until status is `0x50` (AFE ready).
 4. Send `send_cmd(10)` (`[0xA5, 0x5A, 0x00]`).
 
-### 5.2. Finger Presence Detection (FDT Mode)
-1. Send `write_reg(0x9A, 0x5A)` (Enable FDT mode).
-2. Periodically send `send_cmd(2)` (Trigger FDT sense).
-3. Read `read_sram(0x00E8, 8)`.
-4. If capacitive deltas exceed the touch threshold ($> 50$) or `read_reg(0x80) == 0x54`, a finger is actively touching the sensor.
-
-### 5.3. Image Acquisition
-1. Send `write_reg(0x9A, 0x00)` (Disable FDT mode).
-2. Write mode registers:
+### 5.2. Image Acquisition
+1. Write configuration registers:
    * `write_16bit(0x1801, 0xFCA7)`
    * `write_16bit(0x1800, 0x4FFE)`
-3. Send `send_cmd(3)` (`[0xC4, 0x3B, 0x00]`).
-4. Poll `read_reg(0x80)` until `0x54` (Scan complete).
-5. Read $10,240\text{ bytes}$ from SRAM base `0x0000` over EP `0x82`.
-6. Unpack big-endian 16-bit pixels into $80 \times 64$ matrix.
+2. Send `send_cmd(3)` (`[0xC4, 0x3B, 0x00]`) to trigger scan.
+3. Wait $\sim 35\text{ms}$ or poll `read_reg(0x80)` until `0x54` (Scan complete).
+4. Read $10,240\text{ bytes}$ from SRAM base `0x0200` (20 chunks $\times 512\text{ bytes}$).
+5. Unpack big-endian 16-bit pixels into $80 \times 64$ matrix.
+
+---
+
+## 6. Architectural Challenges & Open Research Problems
+
+### 6.1. Small Aperture Minutiae Extraction
+Standard open-source biometric stacks (`libfprint`, NIST NBIS `mindtct`, `bozorth3`) assume a standard 500 DPI scanner capturing at least $10\text{ mm} \times 10\text{ mm}$ of skin area ($200 \times 200+$ pixels). The FW9366 active area is only $\approx 3.2\text{ mm} \times 4.0\text{ mm}$ ($64 \times 80$ sensels). Because only $4\text{ to }6$ minutiae points are typically visible in a single press, standard minutiae-based matchers suffer from low discriminative power without multi-frame composite template stitching.
+
+### 6.2. Internal ADC Recalibration Spikes
+The FW9366 chip automatically executes internal reference voltage refreshes every $\sim 1.5\text{s}$, producing a 1-frame transient spike across $5\text{ to }10$ sensels. Host software must employ a multi-frame persistence filter (`touch_streak >= 2`) or moving baseline auto-calibration to avoid false touch triggers.
+
+### 6.3. Fixed-Pattern Noise (FPN) Filtering
+Raw sensels have slight silicon DC manufacturing variations. Without dynamic baseline tracking, open-source feature extractors can mistakenly treat static DC variation as ridge structure, resulting in false matching between empty frames.
