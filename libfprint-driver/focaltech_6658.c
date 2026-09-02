@@ -34,29 +34,21 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     ((508.0 * SCALE_FACTOR) / 25.4)
 
-#define FDT_TOUCH_THRESHOLD   25
-#define FDT_INTEGRATION_MS    10
-#define FDT_POLL_DELAY_MS     60
+#define TOUCH_DIFF_THRESHOLD 40
+#define POLL_INTERVAL_MS     60
 
-/* Single coherent loop SSM states */
+/* State machine states */
 enum {
   M_INIT_REG,
   M_INIT_WAKE,
   M_INIT_LOCK,
-  M_FDT_ENABLE,
+  M_INIT_CFG_1801,
+  M_INIT_CFG_1800,
   M_WAIT_POLL,
-  M_FDT_SENSE,
-  M_WAIT_INTEGRATE,
-  M_FDT_READ_DATA,
-  M_CAPTURE_DISABLE_FDT,
-  M_CAPTURE_WAKE,
-  M_CAPTURE_LOCK,
-  M_CAPTURE_CFG_1801,
-  M_CAPTURE_CFG_1800,
-  M_CAPTURE_START,
-  M_CAPTURE_WAIT,
-  M_CAPTURE_READ_CHUNK,
-  M_CAPTURE_PROCESS,
+  M_SCAN_TRIGGER,
+  M_SCAN_WAIT,
+  M_READ_CHUNK,
+  M_EVALUATE_FRAME,
   M_NUM_STATES,
 };
 
@@ -65,6 +57,8 @@ struct _FpiDeviceFocaltech6658
   FpImageDevice parent;
   FpiSsm       *ssm;
   guint8       *frame_buf;
+  guint16      *baseline_buf;
+  gboolean      has_baseline;
   gsize         read_offset;
   guint         poll_count;
   gboolean      deactivating;
@@ -107,69 +101,13 @@ dummy_tx_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
 }
 
 static void
-fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
   if (error)
     {
-      g_warning ("[focaltech_6658] FDT read error: %s", error->message);
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
-    }
-
-  guint16 d[8] = { 0 };
-  if (transfer->actual_length >= 16)
-    {
-      for (int i = 0; i < 8; i++)
-        d[i] = (transfer->buffer[i * 2] << 8) | transfer->buffer[i * 2 + 1];
-    }
-  else if (transfer->actual_length >= 8)
-    {
-      for (int i = 0; i < 4; i++)
-        d[i] = (transfer->buffer[i * 2] << 8) | transfer->buffer[i * 2 + 1];
-    }
-
-  self->poll_count++;
-  gboolean active = FALSE;
-  for (int i = 0; i < 8; i++)
-    {
-      if (d[i] > 5) active = TRUE;
-    }
-
-  if (self->poll_count % 10 == 0 || active)
-    {
-      g_message ("[focaltech_6658] FDT poll #%u: deltas=[%d, %d, %d, %d, %d, %d, %d, %d]",
-                 self->poll_count, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-    }
-
-  gboolean touch = FALSE;
-  for (int i = 0; i < 8; i++)
-    {
-      if (d[i] > FDT_TOUCH_THRESHOLD) touch = TRUE;
-    }
-
-  if (touch)
-    {
-      g_message ("[focaltech_6658] *** Finger touch DETECTED! deltas=[%d, %d, %d, %d, %d, %d, %d, %d] ***",
-                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
-      fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_DISABLE_FDT);
-      return;
-    }
-
-  /* No touch, wait and poll again */
-  fpi_ssm_jump_to_state (transfer->ssm, M_WAIT_POLL);
-}
-
-static void
-capture_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
-{
-  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
-
-  if (error)
-    {
-      g_warning ("[focaltech_6658] Capture chunk error: %s", error->message);
+      g_warning ("[focaltech_6658] Read chunk error: %s", error->message);
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
@@ -181,9 +119,9 @@ capture_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, G
     }
 
   if (self->read_offset >= RAW_BUF_SIZE)
-    fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_PROCESS);
+    fpi_ssm_jump_to_state (transfer->ssm, M_EVALUATE_FRAME);
   else
-    fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_READ_CHUNK);
+    fpi_ssm_jump_to_state (transfer->ssm, M_READ_CHUNK);
 }
 
 static void
@@ -220,97 +158,38 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
-    case M_FDT_ENABLE:
-      {
-        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
-        g_message ("[focaltech_6658] FDT sensing enabled (0x9A = 0x5A)");
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
-
-    case M_WAIT_POLL:
-      fpi_ssm_next_state_delayed (ssm, FDT_POLL_DELAY_MS);
-      break;
-
-    case M_FDT_SENSE:
-      {
-        static const guint8 pkt[] = { 0xC2, 0x3D, 0x00 };
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
-
-    case M_WAIT_INTEGRATE:
-      fpi_ssm_next_state_delayed (ssm, FDT_INTEGRATION_MS);
-      break;
-
-    case M_FDT_READ_DATA:
-      {
-        /* FW9366 FDT deltas are at SRAM 0x00B8 (8 words = 16 bytes) */
-        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xB8, 0x00, 0x08 };
-        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
-        tx->short_is_error = TRUE;
-        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_deltas_cmd, 6), 6, g_free);
-        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 dummy_tx_cb, NULL);
-
-        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
-        rx->ssm = ssm;
-        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 16);
-        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 fdt_read_cb, NULL);
-      }
-      break;
-
-    case M_CAPTURE_DISABLE_FDT:
-      {
-        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x00 };
-        g_message ("[focaltech_6658] Preparing capture: Disable FDT");
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
-
-    case M_CAPTURE_WAKE:
-      {
-        static const guint8 pkt[] = { 0x5A, 0xA5, 0x00 };
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
-
-    case M_CAPTURE_LOCK:
-      {
-        static const guint8 pkt[] = { 0xA5, 0x5A, 0x00 };
-        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
-      }
-      break;
-
-    case M_CAPTURE_CFG_1801:
+    case M_INIT_CFG_1801:
       {
         static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC };
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
-    case M_CAPTURE_CFG_1800:
+    case M_INIT_CFG_1800:
       {
         static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F };
+        g_message ("[focaltech_6658] Continuous matrix scanning initialized");
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
-    case M_CAPTURE_START:
+    case M_WAIT_POLL:
+      fpi_ssm_next_state_delayed (ssm, POLL_INTERVAL_MS);
+      break;
+
+    case M_SCAN_TRIGGER:
       self->read_offset = 0;
       {
         static const guint8 pkt[] = { 0xC4, 0x3B, 0x00 };
-        g_message ("[focaltech_6658] Triggering image scan (Cmd 3)");
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
-    case M_CAPTURE_WAIT:
-      fpi_ssm_next_state_delayed (ssm, 40);
+    case M_SCAN_WAIT:
+      fpi_ssm_next_state_delayed (ssm, 35);
       break;
 
-    case M_CAPTURE_READ_CHUNK:
+    case M_READ_CHUNK:
       {
         guint16 cur_addr = SRAM_FRAME_BASE + self->read_offset;
         guint8 sram_cmd[6] = {
@@ -330,61 +209,100 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         rx->ssm = ssm;
         fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 512);
         fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 capture_chunk_cb, NULL);
+                                 read_chunk_cb, NULL);
       }
       break;
 
-    case M_CAPTURE_PROCESS:
+    case M_EVALUATE_FRAME:
       {
-        FpImage *img = fp_image_new (IMAGE_WIDTH, IMAGE_HEIGHT);
-        img->ppmm = SENSOR_PPMM;
-        img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL;
-
-        guint16 *pixels = g_malloc (RAW_PIXELS * sizeof (guint16));
-        guint16 *sorted = g_malloc (RAW_PIXELS * sizeof (guint16));
-        guint8 *raw_norm = g_malloc (RAW_PIXELS);
-
+        guint16 *cur_pixels = g_malloc (RAW_PIXELS * sizeof (guint16));
         for (int i = 0; i < RAW_PIXELS; i++)
+          cur_pixels[i] = (self->frame_buf[i * 2] << 8) | self->frame_buf[i * 2 + 1];
+
+        if (!self->has_baseline)
           {
-            guint16 px = (self->frame_buf[i * 2] << 8) | self->frame_buf[i * 2 + 1];
-            pixels[i] = px;
-            sorted[i] = px;
+            memcpy (self->baseline_buf, cur_pixels, RAW_PIXELS * sizeof (guint16));
+            self->has_baseline = TRUE;
+            g_free (cur_pixels);
+            g_message ("[focaltech_6658] Idle sensor matrix baseline calibrated");
+            fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
+            return;
           }
 
-        qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
-        guint16 p_low  = sorted[(RAW_PIXELS * 2) / 100];
-        guint16 p_high = sorted[(RAW_PIXELS * 98) / 100];
-        g_free (sorted);
-
-        guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
+        /* Calculate max delta across valid pixels */
+        guint16 max_diff = 0;
+        guint touch_count = 0;
         for (int i = 0; i < RAW_PIXELS; i++)
           {
-            guint16 px = pixels[i];
-            if (px < p_low) px = p_low;
-            if (px > p_high) px = p_high;
-            guint32 val = ((guint32)(px - p_low) * 255) / range;
-            raw_norm[i] = (guint8) val;
-          }
-        g_free (pixels);
-
-        /* 2x Bilinear upscaling to 128x160 for optimal NIST mindtct feature extraction */
-        for (int y = 0; y < IMAGE_HEIGHT; y++)
-          {
-            int src_y = y / SCALE_FACTOR;
-            for (int x = 0; x < IMAGE_WIDTH; x++)
+            guint16 b = self->baseline_buf[i];
+            guint16 c = cur_pixels[i];
+            if (b < 60000 && c < 60000)
               {
-                int src_x = x / SCALE_FACTOR;
-                img->data[y * IMAGE_WIDTH + x] = raw_norm[src_y * RAW_WIDTH + src_x];
+                guint16 diff = (c > b) ? (c - b) : (b - c);
+                if (diff > max_diff) max_diff = diff;
+                if (diff > 15) touch_count++;
               }
           }
-        g_free (raw_norm);
 
-        g_message ("[focaltech_6658] Frame captured & normalized: p2=%d, p98=%d, range=%d, dim=%dx%d",
-                   p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT);
+        self->poll_count++;
+        if (self->poll_count % 10 == 0 || touch_count > 0)
+          {
+            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%u",
+                       self->poll_count, touch_count, max_diff);
+          }
 
-        fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
-        fpi_ssm_mark_completed (ssm);
-        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+        if (max_diff > TOUCH_DIFF_THRESHOLD || touch_count >= 8)
+          {
+            g_message ("[focaltech_6658] *** FINGER TOUCH DETECTED! (sensels=%u, max_diff=%u) ***",
+                       touch_count, max_diff);
+
+            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+
+            /* Contrast stretch and upscale */
+            FpImage *img = fp_image_new (IMAGE_WIDTH, IMAGE_HEIGHT);
+            img->ppmm = SENSOR_PPMM;
+            img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL;
+
+            guint16 *sorted = g_memdup2 (cur_pixels, RAW_PIXELS * sizeof (guint16));
+            qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
+            guint16 p_low  = sorted[(RAW_PIXELS * 2) / 100];
+            guint16 p_high = sorted[(RAW_PIXELS * 98) / 100];
+            g_free (sorted);
+
+            guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
+            guint8 *raw_norm = g_malloc (RAW_PIXELS);
+            for (int i = 0; i < RAW_PIXELS; i++)
+              {
+                guint16 px = cur_pixels[i];
+                if (px < p_low) px = p_low;
+                if (px > p_high) px = p_high;
+                raw_norm[i] = (guint8)(((guint32)(px - p_low) * 255) / range);
+              }
+
+            /* 2x Bilinear upscaling to 128x160 for optimal NIST mindtct feature extraction */
+            for (int y = 0; y < IMAGE_HEIGHT; y++)
+              {
+                int src_y = y / SCALE_FACTOR;
+                for (int x = 0; x < IMAGE_WIDTH; x++)
+                  {
+                    int src_x = x / SCALE_FACTOR;
+                    img->data[y * IMAGE_WIDTH + x] = raw_norm[src_y * RAW_WIDTH + src_x];
+                  }
+              }
+            g_free (raw_norm);
+            g_free (cur_pixels);
+
+            g_message ("[focaltech_6658] Frame captured & normalized: p2=%d, p98=%d, range=%d, dim=%dx%d",
+                       p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT);
+
+            fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
+            fpi_ssm_mark_completed (ssm);
+            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+            return;
+          }
+
+        g_free (cur_pixels);
+        fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
       }
       break;
     }
@@ -418,6 +336,8 @@ focaltech_dev_open (FpImageDevice *dev)
     }
 
   self->frame_buf = g_malloc0 (RAW_BUF_SIZE);
+  self->baseline_buf = g_malloc0 (RAW_PIXELS * sizeof (guint16));
+  self->has_baseline = FALSE;
   self->poll_count = 0;
   fpi_image_device_open_complete (dev, NULL);
   g_message ("[focaltech_6658] Device opened successfully (2808:6658)");
@@ -431,6 +351,7 @@ focaltech_dev_close (FpImageDevice *dev)
   GError *error = NULL;
 
   g_clear_pointer (&self->frame_buf, g_free);
+  g_clear_pointer (&self->baseline_buf, g_free);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
   fpi_image_device_close_complete (dev, error);
   g_message ("[focaltech_6658] Device closed");
@@ -442,6 +363,7 @@ focaltech_dev_activate (FpImageDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   self->deactivating = FALSE;
+  self->has_baseline = FALSE;
   g_message ("[focaltech_6658] Device activated");
   fpi_image_device_activate_complete (dev, NULL);
 }
