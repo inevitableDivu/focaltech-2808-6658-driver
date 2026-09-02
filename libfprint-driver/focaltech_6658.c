@@ -23,29 +23,27 @@
 #define FT_EP_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
 #define FT_EP_IN  (0x02 | FPI_USB_ENDPOINT_IN)
 
-#define RAW_WIDTH      64
-#define RAW_HEIGHT     80
-#define RAW_PIXELS     (RAW_WIDTH * RAW_HEIGHT)
-#define RAW_BUF_SIZE   (RAW_PIXELS * 2)
+#define RAW_WIDTH       64
+#define RAW_HEIGHT      80
+#define RAW_PIXELS      (RAW_WIDTH * RAW_HEIGHT)
+#define RAW_BUF_SIZE    (RAW_PIXELS * 2)
 #define SRAM_FRAME_BASE 0x0200
 
-#define SCALE_FACTOR   2
-#define IMAGE_WIDTH    (RAW_WIDTH * SCALE_FACTOR)
-#define IMAGE_HEIGHT   (RAW_HEIGHT * SCALE_FACTOR)
-#define SENSOR_PPMM    ((508.0 * SCALE_FACTOR) / 25.4)
+#define SCALE_FACTOR    2
+#define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
+#define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
+#define SENSOR_PPMM     ((508.0 * SCALE_FACTOR) / 25.4)
 
 #define FDT_TOUCH_THRESHOLD   50
 #define FDT_RELEASE_THRESHOLD 25
 #define FDT_INTEGRATION_MS    10
-#define FDT_POLL_DELAY_MS     50
+#define FDT_POLL_DELAY_MS     60
 
-/* USB command packets */
-static const guint8 cmd_fdt_sense[] = { 0xC2, 0x3D, 0x00 };
-static const guint8 cmd_scan_img[]  = { 0xC4, 0x3B, 0x00 };
-
-/* FDT Sense SSM states */
+/* FDT Sense SSM states (each packet in separate state) */
 enum {
-  FDT_STATE_INIT_AFE,
+  FDT_STATE_INIT_REG,
+  FDT_STATE_INIT_WAKE,
+  FDT_STATE_INIT_LOCK,
   FDT_STATE_ENABLE,
   FDT_STATE_WAIT_POLL,
   FDT_STATE_SENSE,
@@ -57,7 +55,11 @@ enum {
 
 /* Capture SSM states */
 enum {
-  CAP_STATE_PREPARE,
+  CAP_STATE_DISABLE_FDT,
+  CAP_STATE_WAKE,
+  CAP_STATE_LOCK,
+  CAP_STATE_CFG_1801,
+  CAP_STATE_CFG_1800,
   CAP_STATE_START,
   CAP_STATE_WAIT,
   CAP_STATE_READ_CHUNK,
@@ -81,6 +83,7 @@ struct _FpiDeviceFocaltech6658
   FpiSsm       *active_ssm;
   guint8       *frame_buf;
   gsize         read_offset;
+  guint         poll_count;
   gboolean      deactivating;
 };
 
@@ -125,6 +128,7 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
 
   if (error)
     {
+      g_warning ("[focaltech_6658] FDT read error: %s", error->message);
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
@@ -136,10 +140,18 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
       guint16 d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
       guint16 d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
 
+      self->poll_count++;
+      if (self->poll_count % 10 == 0 || (d0 > 10 || d1 > 10 || d2 > 10 || d3 > 10))
+        {
+          g_message ("[focaltech_6658] FDT poll #%u deltas: [%d, %d, %d, %d]",
+                     self->poll_count, d0, d1, d2, d3);
+        }
+
       if (d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
           d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
         {
-          fp_dbg ("Finger touch detected: [%d, %d, %d, %d]", d0, d1, d2, d3);
+          g_message ("[focaltech_6658] *** Finger touch DETECTED! *** [%d, %d, %d, %d]",
+                     d0, d1, d2, d3);
           fpi_ssm_mark_completed (transfer->ssm);
           fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
           return;
@@ -162,21 +174,32 @@ fdt_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case FDT_STATE_INIT_AFE:
+    case FDT_STATE_INIT_REG:
       {
-        static const guint8 init_pkt[] = {
-          0x09, 0xF6, 0xC6, 0x00,
-          0x5A, 0xA5, 0x00,
-          0xA5, 0x5A, 0x00
-        };
-        ft_send_bulk_cmd (self, init_pkt, sizeof (init_pkt));
+        static const guint8 pkt[] = { 0x09, 0xF6, 0xC6, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case FDT_STATE_INIT_WAKE:
+      {
+        static const guint8 pkt[] = { 0x5A, 0xA5, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case FDT_STATE_INIT_LOCK:
+      {
+        static const guint8 pkt[] = { 0xA5, 0x5A, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
     case FDT_STATE_ENABLE:
       {
-        static const guint8 fdt_on_pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
-        ft_send_bulk_cmd (self, fdt_on_pkt, sizeof (fdt_on_pkt));
+        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
+        g_message ("[focaltech_6658] FDT sensing enabled (0x9A = 0x5A)");
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
@@ -185,7 +208,10 @@ fdt_ssm_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case FDT_STATE_SENSE:
-      ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      {
+        static const guint8 pkt[] = { 0xC2, 0x3D, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
       break;
 
     case FDT_STATE_WAIT_INTEGRATE:
@@ -194,8 +220,8 @@ fdt_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
     case FDT_STATE_READ_CMD:
       {
-        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
-        ft_send_bulk_cmd (self, read_deltas_cmd, sizeof (read_deltas_cmd));
+        static const guint8 pkt[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
@@ -219,7 +245,7 @@ fdt_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 }
 
 /* ========================================================================= */
-/* Phase 2: Frame Capture & Normalization SSM (Reading from 0x0200)          */
+/* Phase 2: Frame Capture & Normalization SSM                                */
 /* ========================================================================= */
 
 static void
@@ -229,6 +255,7 @@ capture_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, G
 
   if (error)
     {
+      g_warning ("[focaltech_6658] Capture chunk error: %s", error->message);
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
@@ -258,22 +285,49 @@ capture_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case CAP_STATE_PREPARE:
+    case CAP_STATE_DISABLE_FDT:
       {
-        static const guint8 prep_pkt[] = {
-          0x09, 0xF6, 0x9A, 0x00,
-          0x5A, 0xA5, 0x00,
-          0xA5, 0x5A, 0x00,
-          0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC,
-          0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F,
-        };
-        ft_send_bulk_cmd (self, prep_pkt, sizeof (prep_pkt));
+        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x00 };
+        g_message ("[focaltech_6658] Preparing capture: Disable FDT");
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case CAP_STATE_WAKE:
+      {
+        static const guint8 pkt[] = { 0x5A, 0xA5, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case CAP_STATE_LOCK:
+      {
+        static const guint8 pkt[] = { 0xA5, 0x5A, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case CAP_STATE_CFG_1801:
+      {
+        static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case CAP_STATE_CFG_1800:
+      {
+        static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
     case CAP_STATE_START:
       self->read_offset = 0;
-      ft_send_bulk_cmd (self, cmd_scan_img, sizeof (cmd_scan_img));
+      {
+        static const guint8 pkt[] = { 0xC4, 0x3B, 0x00 };
+        g_message ("[focaltech_6658] Triggering image scan (Cmd 3)");
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
       break;
 
     case CAP_STATE_WAIT:
@@ -349,8 +403,8 @@ capture_ssm_state (FpiSsm *ssm, FpDevice *dev)
           }
         g_free (raw_norm);
 
-        fp_dbg ("Captured frame from 0x0200: p_low=%d, p_high=%d, range=%d, dim=%dx%d, ppmm=%.2f",
-                p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
+        g_message ("[focaltech_6658] Frame captured & normalized: p2=%d, p98=%d, range=%d, dim=%dx%d",
+                   p_low, p_high, range, IMAGE_WIDTH, IMAGE_HEIGHT);
 
         fpi_ssm_mark_completed (ssm);
         fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
@@ -377,6 +431,7 @@ finger_off_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
 
   if (error)
     {
+      g_warning ("[focaltech_6658] Finger off read error: %s", error->message);
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
@@ -391,7 +446,7 @@ finger_off_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
       if (d0 < FDT_RELEASE_THRESHOLD && d1 < FDT_RELEASE_THRESHOLD &&
           d2 < FDT_RELEASE_THRESHOLD && d3 < FDT_RELEASE_THRESHOLD)
         {
-          fp_dbg ("Finger lifted: [%d, %d, %d, %d]", d0, d1, d2, d3);
+          g_message ("[focaltech_6658] Finger lifted ([%d, %d, %d, %d])", d0, d1, d2, d3);
           fpi_ssm_mark_completed (transfer->ssm);
           fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
           return;
@@ -419,7 +474,10 @@ finger_off_ssm_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case OFF_STATE_SENSE:
-      ft_send_bulk_cmd (self, cmd_fdt_sense, sizeof (cmd_fdt_sense));
+      {
+        static const guint8 pkt[] = { 0xC2, 0x3D, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
       break;
 
     case OFF_STATE_WAIT_INTEGRATE:
@@ -428,8 +486,8 @@ finger_off_ssm_state (FpiSsm *ssm, FpDevice *dev)
 
     case OFF_STATE_READ_CMD:
       {
-        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
-        ft_send_bulk_cmd (self, read_deltas_cmd, sizeof (read_deltas_cmd));
+        static const guint8 pkt[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
@@ -465,13 +523,15 @@ focaltech_dev_open (FpImageDevice *dev)
   g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
   if (error)
     {
+      g_warning ("[focaltech_6658] Open error: %s", error->message);
       fpi_image_device_open_complete (dev, error);
       return;
     }
 
   self->frame_buf = g_malloc0 (RAW_BUF_SIZE);
+  self->poll_count = 0;
   fpi_image_device_open_complete (dev, NULL);
-  fp_dbg ("FocalTech 2808:6658 device opened");
+  g_message ("[focaltech_6658] Device opened successfully (2808:6658)");
 }
 
 static void
@@ -483,7 +543,7 @@ focaltech_dev_close (FpImageDevice *dev)
   g_clear_pointer (&self->frame_buf, g_free);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
   fpi_image_device_close_complete (dev, error);
-  fp_dbg ("FocalTech 2808:6658 device closed");
+  g_message ("[focaltech_6658] Device closed");
 }
 
 static void
@@ -491,6 +551,7 @@ focaltech_dev_activate (FpImageDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   self->deactivating = FALSE;
+  g_message ("[focaltech_6658] Device activated");
   fpi_image_device_activate_complete (dev, NULL);
 }
 
@@ -500,6 +561,7 @@ focaltech_dev_deactivate (FpImageDevice *dev)
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
 
   self->deactivating = TRUE;
+  g_message ("[focaltech_6658] Device deactivating");
   if (self->active_ssm)
     {
       fpi_ssm_cancel_delayed_state_change (self->active_ssm);
@@ -517,6 +579,8 @@ focaltech_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
   if (self->deactivating)
     return;
 
+  g_message ("[focaltech_6658] State transition -> %d", state);
+
   if (self->active_ssm)
     {
       fpi_ssm_cancel_delayed_state_change (self->active_ssm);
@@ -527,6 +591,7 @@ focaltech_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
   switch (state)
     {
     case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
+      self->poll_count = 0;
       self->active_ssm = fpi_ssm_new (FP_DEVICE (self), fdt_ssm_state, FDT_NUM_STATES);
       fpi_ssm_start (self->active_ssm, fdt_ssm_complete);
       break;
