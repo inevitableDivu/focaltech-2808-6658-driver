@@ -34,7 +34,7 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     ((508.0 * SCALE_FACTOR) / 25.4)
 
-#define FDT_TOUCH_THRESHOLD   20
+#define FDT_TOUCH_THRESHOLD   25
 #define FDT_INTEGRATION_MS    10
 #define FDT_POLL_DELAY_MS     60
 
@@ -118,27 +118,41 @@ fdt_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
       return;
     }
 
-  guint16 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-  if (transfer->actual_length >= 8)
+  guint16 d[8] = { 0 };
+  if (transfer->actual_length >= 16)
     {
-      d0 = (transfer->buffer[0] << 8) | transfer->buffer[1];
-      d1 = (transfer->buffer[2] << 8) | transfer->buffer[3];
-      d2 = (transfer->buffer[4] << 8) | transfer->buffer[5];
-      d3 = (transfer->buffer[6] << 8) | transfer->buffer[7];
+      for (int i = 0; i < 8; i++)
+        d[i] = (transfer->buffer[i * 2] << 8) | transfer->buffer[i * 2 + 1];
+    }
+  else if (transfer->actual_length >= 8)
+    {
+      for (int i = 0; i < 4; i++)
+        d[i] = (transfer->buffer[i * 2] << 8) | transfer->buffer[i * 2 + 1];
     }
 
   self->poll_count++;
-  if (self->poll_count % 10 == 0 || (d0 > 5 || d1 > 5 || d2 > 5 || d3 > 5))
+  gboolean active = FALSE;
+  for (int i = 0; i < 8; i++)
     {
-      g_message ("[focaltech_6658] FDT poll #%u: deltas=[%d, %d, %d, %d]",
-                 self->poll_count, d0, d1, d2, d3);
+      if (d[i] > 5) active = TRUE;
     }
 
-  if (d0 > FDT_TOUCH_THRESHOLD || d1 > FDT_TOUCH_THRESHOLD ||
-      d2 > FDT_TOUCH_THRESHOLD || d3 > FDT_TOUCH_THRESHOLD)
+  if (self->poll_count % 10 == 0 || active)
     {
-      g_message ("[focaltech_6658] *** Finger touch DETECTED! deltas=[%d, %d, %d, %d] ***",
-                 d0, d1, d2, d3);
+      g_message ("[focaltech_6658] FDT poll #%u: deltas=[%d, %d, %d, %d, %d, %d, %d, %d]",
+                 self->poll_count, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+    }
+
+  gboolean touch = FALSE;
+  for (int i = 0; i < 8; i++)
+    {
+      if (d[i] > FDT_TOUCH_THRESHOLD) touch = TRUE;
+    }
+
+  if (touch)
+    {
+      g_message ("[focaltech_6658] *** Finger touch DETECTED! deltas=[%d, %d, %d, %d, %d, %d, %d, %d] ***",
+                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
       fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
       fpi_ssm_jump_to_state (transfer->ssm, M_CAPTURE_DISABLE_FDT);
       return;
@@ -231,7 +245,8 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
     case M_FDT_READ_DATA:
       {
-        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xE8, 0x00, 0x04 };
+        /* FW9366 FDT deltas are at SRAM 0x00B8 (8 words = 16 bytes) */
+        static const guint8 read_deltas_cmd[] = { 0x04, 0xFB, 0x80, 0xB8, 0x00, 0x08 };
         FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
         tx->short_is_error = TRUE;
         fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (read_deltas_cmd, 6), 6, g_free);
@@ -240,7 +255,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
         FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
         rx->ssm = ssm;
-        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 8);
+        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 16);
         fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
                                  fdt_read_cb, NULL);
       }
