@@ -1,0 +1,28 @@
+# Proprietary Windows Vendor Binaries & Blobs
+vendor_blobs/
+*.dll
+*.sys
+*.cat
+*.inf
+*.bin
+
+# Biometric Data & Scans (Never commit personal fingerprints!)
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.raw
+*.npy
+
+# Python Virtual Environments & Bytecode
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.egg-info/
+
+# Build Artefacts
+builddir/
+subprojects/
