@@ -70,6 +70,14 @@ static const FpIdEntry id_table[] = {
   { .vid = 0, .pid = 0, .driver_data = 0 }
 };
 
+static int
+compare_u16 (const void *a, const void *b)
+{
+  guint16 arg1 = *(const guint16 *) a;
+  guint16 arg2 = *(const guint16 *) b;
+  return (arg1 > arg2) - (arg1 < arg2);
+}
+
 static void
 ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 {
@@ -209,7 +217,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case M_CAPTURE_WAIT:
-      fpi_ssm_next_state_delayed (ssm, 40); /* 40ms capture delay asynchronously */
+      fpi_ssm_next_state_delayed (ssm, 40); /* 40ms capture delay */
       break;
 
     case M_CAPTURE_READ_CHUNK:
@@ -239,27 +247,36 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
     case M_CAPTURE_PROCESS:
       {
         FpImage *img = fp_image_new (SENSOR_WIDTH, SENSOR_HEIGHT);
+        img->flags |= FPI_IMAGE_COLORS_INVERTED;
 
-        guint16 min_v = 65535, max_v = 0;
         guint16 *pixels = g_malloc (SENSOR_PIXELS * sizeof (guint16));
+        guint16 *sorted = g_malloc (SENSOR_PIXELS * sizeof (guint16));
 
         for (int i = 0; i < SENSOR_PIXELS; i++)
           {
             guint16 px = (self->frame_buf[i * 2] << 8) | self->frame_buf[i * 2 + 1];
             pixels[i] = px;
-            if (px < min_v) min_v = px;
-            if (px > max_v) max_v = px;
+            sorted[i] = px;
           }
 
-        guint32 range = (max_v > min_v) ? (max_v - min_v) : 1;
+        /* Sort to find percentiles and eliminate outlier hot/dead pixels */
+        qsort (sorted, SENSOR_PIXELS, sizeof (guint16), compare_u16);
+        guint16 p_low  = sorted[(SENSOR_PIXELS * 2) / 100];   /* 2nd percentile */
+        guint16 p_high = sorted[(SENSOR_PIXELS * 98) / 100];  /* 98th percentile */
+        g_free (sorted);
+
+        guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
         for (int i = 0; i < SENSOR_PIXELS; i++)
           {
-            guint32 val = ((guint32)(pixels[i] - min_v) * 255) / range;
+            guint16 px = pixels[i];
+            if (px < p_low) px = p_low;
+            if (px > p_high) px = p_high;
+            guint32 val = ((guint32)(px - p_low) * 255) / range;
             img->data[i] = (guint8) val;
           }
         g_free (pixels);
 
-        fp_dbg ("Frame processed: min=%d, max=%d, range=%d", min_v, max_v, range);
+        fp_dbg ("Frame contrast-normalized: p_low=%d, p_high=%d, range=%d", p_low, p_high, range);
         fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
         fpi_ssm_mark_completed (ssm);
         fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
@@ -385,5 +402,5 @@ fpi_device_focaltech_6658_class_init (FpiDeviceFocaltech6658Class *klass)
 
   img_class->img_width = SENSOR_WIDTH;
   img_class->img_height = SENSOR_HEIGHT;
-  img_class->bz3_threshold = 15;
+  img_class->bz3_threshold = 12;
 }
