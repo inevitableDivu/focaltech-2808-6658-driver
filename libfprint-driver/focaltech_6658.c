@@ -34,8 +34,10 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     (500.0 / 25.4) /* Standard 500 DPI for NIST NBIS */
 
-#define TOUCH_DIFF_THRESHOLD 25
+#define TOUCH_DIFF_THRESHOLD 75
+#define TOUCH_MIN_SENSELS    12
 #define POLL_INTERVAL_MS     60
+#define BASELINE_WARMUP_CYCLES 3
 
 /* State machine states */
 enum {
@@ -57,8 +59,8 @@ struct _FpiDeviceFocaltech6658
   FpImageDevice parent;
   FpiSsm       *ssm;
   guint8       *frame_buf;
-  guint16      *baseline_buf;
-  gboolean      has_baseline;
+  gfloat       *baseline_buf;
+  guint         warmup_count;
   gsize         read_offset;
   guint         poll_count;
   gboolean      deactivating;
@@ -220,42 +222,47 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         for (int i = 0; i < RAW_PIXELS; i++)
           cur_pixels[i] = (self->frame_buf[i * 2] << 8) | self->frame_buf[i * 2 + 1];
 
-        if (!self->has_baseline)
+        if (self->warmup_count < BASELINE_WARMUP_CYCLES)
           {
-            memcpy (self->baseline_buf, cur_pixels, RAW_PIXELS * sizeof (guint16));
-            self->has_baseline = TRUE;
+            for (int i = 0; i < RAW_PIXELS; i++)
+              {
+                if (self->warmup_count == 0)
+                  self->baseline_buf[i] = (gfloat) cur_pixels[i];
+                else
+                  self->baseline_buf[i] = self->baseline_buf[i] * 0.7f + (gfloat) cur_pixels[i] * 0.3f;
+              }
+            self->warmup_count++;
             g_free (cur_pixels);
-            g_message ("[focaltech_6658] Idle sensor matrix baseline calibrated");
             fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
             return;
           }
 
-        /* Calculate delta vs baseline for touch detection */
-        guint16 max_diff = 0;
+        /* Calculate delta vs EMA baseline */
+        gfloat max_diff = 0;
         guint touch_count = 0;
 
         for (int i = 0; i < RAW_PIXELS; i++)
           {
-            guint16 b = self->baseline_buf[i];
-            guint16 c = cur_pixels[i];
-            if (b < 60000 && c < 60000)
+            gfloat b = self->baseline_buf[i];
+            gfloat c = (gfloat) cur_pixels[i];
+            if (b < 50000.0f && c < 50000.0f)
               {
-                guint16 diff = (c > b) ? (c - b) : (b - c);
+                gfloat diff = (c > b) ? (c - b) : (b - c);
                 if (diff > max_diff) max_diff = diff;
-                if (diff > 15) touch_count++;
+                if (diff > 45.0f) touch_count++;
               }
           }
 
         self->poll_count++;
         if (self->poll_count % 10 == 0 || touch_count > 0)
           {
-            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%u",
+            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%.1f",
                        self->poll_count, touch_count, max_diff);
           }
 
-        if (max_diff > TOUCH_DIFF_THRESHOLD || touch_count >= 8)
+        if (max_diff > (gfloat) TOUCH_DIFF_THRESHOLD && touch_count >= TOUCH_MIN_SENSELS)
           {
-            g_message ("[focaltech_6658] *** FINGER TOUCH DETECTED! (sensels=%u, max_diff=%u) ***",
+            g_message ("[focaltech_6658] *** REAL FINGER TOUCH DETECTED! (sensels=%u, max_diff=%.1f) ***",
                        touch_count, max_diff);
 
             fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
@@ -312,7 +319,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
               }
             g_free (raw_norm);
 
-            g_message ("[focaltech_6658] 2D Bilinear frame delivered to mindtct: p2=%d, p98=%d, dim=%dx%d, ppmm=%.2f",
+            g_message ("[focaltech_6658] Frame delivered to mindtct: p2=%d, p98=%d, dim=%dx%d, ppmm=%.2f",
                        p_low, p_high, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
 
             fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
@@ -320,6 +327,10 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
             fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
             return;
           }
+
+        /* Update EMA baseline when no touch */
+        for (int i = 0; i < RAW_PIXELS; i++)
+          self->baseline_buf[i] = self->baseline_buf[i] * 0.85f + (gfloat) cur_pixels[i] * 0.15f;
 
         g_free (cur_pixels);
         fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
@@ -356,8 +367,8 @@ focaltech_dev_open (FpImageDevice *dev)
     }
 
   self->frame_buf = g_malloc0 (RAW_BUF_SIZE);
-  self->baseline_buf = g_malloc0 (RAW_PIXELS * sizeof (guint16));
-  self->has_baseline = FALSE;
+  self->baseline_buf = g_malloc0 (RAW_PIXELS * sizeof (gfloat));
+  self->warmup_count = 0;
   self->poll_count = 0;
   fpi_image_device_open_complete (dev, NULL);
   g_message ("[focaltech_6658] Device opened successfully (2808:6658)");
@@ -383,7 +394,7 @@ focaltech_dev_activate (FpImageDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   self->deactivating = FALSE;
-  self->has_baseline = FALSE;
+  self->warmup_count = 0;
   g_message ("[focaltech_6658] Device activated");
   fpi_image_device_activate_complete (dev, NULL);
 }
@@ -398,7 +409,6 @@ focaltech_dev_deactivate (FpImageDevice *dev)
   g_message ("[focaltech_6658] Device deactivating");
   if (self->ssm)
     {
-      fpi_ssm_cancel_delayed_state_change (self->ssm);
       fpi_ssm_mark_completed (self->ssm);
     }
   else
@@ -420,6 +430,7 @@ focaltech_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
   if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
     {
+      self->warmup_count = 0;
       if (!self->ssm)
         {
           self->poll_count = 0;
