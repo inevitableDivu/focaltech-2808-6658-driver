@@ -34,8 +34,8 @@
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     (500.0 / 25.4) /* Standard 500 DPI for NIST NBIS */
 
-#define TOUCH_DIFF_THRESHOLD 75
-#define TOUCH_MIN_SENSELS    12
+#define TOUCH_DIFF_THRESHOLD 60
+#define TOUCH_MIN_SENSELS    6
 #define POLL_INTERVAL_MS     60
 #define BASELINE_WARMUP_CYCLES 3
 
@@ -249,7 +249,7 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
               {
                 gfloat diff = (c > b) ? (c - b) : (b - c);
                 if (diff > max_diff) max_diff = diff;
-                if (diff > 45.0f) touch_count++;
+                if (diff > 40.0f) touch_count++;
               }
           }
 
@@ -407,11 +407,7 @@ focaltech_dev_deactivate (FpImageDevice *dev)
 
   self->deactivating = TRUE;
   g_message ("[focaltech_6658] Device deactivating");
-  if (self->ssm)
-    {
-      fpi_ssm_mark_completed (self->ssm);
-    }
-  else
+  if (self->ssm == NULL)
     {
       fpi_image_device_deactivate_complete (dev, NULL);
     }
