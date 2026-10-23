@@ -74,6 +74,18 @@ Reverse-engineering tiny capacitive match-on-host fingerprint sensors under Linu
 
 ---
 
+## Native libfprint / fprintd troubleshooting
+
+The Arch recipe requests all registered libfprint drivers so the custom `focaltech_6658` backend is not silently excluded by a default-driver selection. After installation, restart the daemon and inspect its logs:
+
+```bash
+sudo systemctl restart fprintd
+fprintd-list "$USER"
+journalctl -u fprintd -b --no-pager
+```
+
+A successful compile is not proof that enrollment works. The backend is experimental and must be tested on the exact sensor revision. Check the Meson summary for `focaltech_6658` and confirm that another system libfprint library is not shadowing the packaged build.
+
 ## 🚀 Testing with Python (Hardware Verification)
 
 ### 1. Set Up `udev` Permissions
