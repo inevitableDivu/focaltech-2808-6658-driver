@@ -32,7 +32,7 @@
 #define SCALE_FACTOR    4
 #define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
-#define SENSOR_PPMM     (500.0 / 25.4) /* Standard 500 DPI for NIST NBIS */
+#define SENSOR_PPMM     ((RAW_WIDTH * SCALE_FACTOR) / 3.2) /* Upsampled pixels per mm, using 3.2 mm active width */
 
 #define TOUCH_DIFF_THRESHOLD   75
 #define TOUCH_MIN_SENSELS      15
@@ -100,15 +100,10 @@ ft_send_bulk_cmd (FpiDeviceFocaltech6658 *self, const guint8 *cmd, gsize len)
 }
 
 static void
-dummy_tx_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
-{
-  /* OUT command sent; IN transfer handles state completion */
-}
-
-static void
 read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+  gsize bytes_left;
 
   if (error)
     {
@@ -118,16 +113,54 @@ read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GErr
       return;
     }
 
-  if (transfer->actual_length > 0)
+  bytes_left = RAW_BUF_SIZE - self->read_offset;
+  if (transfer->actual_length == 0 || transfer->actual_length > bytes_left)
     {
-      memcpy (self->frame_buf + self->read_offset, transfer->buffer, transfer->actual_length);
-      self->read_offset += transfer->actual_length;
+      GError *read_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                                "Invalid SRAM chunk length from FocalTech device");
+      fpi_ssm_mark_failed (transfer->ssm, read_error);
+      return;
     }
+
+  memcpy (self->frame_buf + self->read_offset, transfer->buffer, transfer->actual_length);
+  self->read_offset += transfer->actual_length;
 
   if (self->read_offset >= RAW_BUF_SIZE)
     fpi_ssm_jump_to_state (transfer->ssm, M_EVALUATE_FRAME);
   else
     fpi_ssm_jump_to_state (transfer->ssm, M_READ_CHUNK);
+}
+
+/* Start the IN response only after the corresponding OUT request completes. */
+static void
+read_request_sent_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+  FpiUsbTransfer *rx;
+  gsize bytes_left;
+  gsize chunk_size;
+
+  if (error)
+    {
+      if (!self->deactivating)
+        g_warning ("[focaltech_6658] SRAM read request failed: %s", error->message);
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  bytes_left = RAW_BUF_SIZE - self->read_offset;
+  chunk_size = MIN ((gsize) 512, bytes_left);
+  if (chunk_size == 0)
+    {
+      fpi_ssm_jump_to_state (transfer->ssm, M_EVALUATE_FRAME);
+      return;
+    }
+
+  rx = fpi_usb_transfer_new (FP_DEVICE (self));
+  rx->ssm = transfer->ssm;
+  fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, chunk_size);
+  fpi_usb_transfer_submit (rx, 1000, fpi_device_get_cancellable (FP_DEVICE (self)),
+                           read_chunk_cb, NULL);
 }
 
 static void
@@ -197,25 +230,24 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
     case M_READ_CHUNK:
       {
-        guint16 cur_addr = SRAM_FRAME_BASE + self->read_offset;
+        guint16 cur_addr = (guint16) (SRAM_FRAME_BASE + self->read_offset);
+        gsize bytes_left = RAW_BUF_SIZE - self->read_offset;
+        guint16 words = (guint16) (MIN ((gsize) 512, bytes_left) / 2);
         guint8 sram_cmd[6] = {
           0x04, 0xFB,
           (guint8)(((cur_addr >> 8) | 0x80) & 0xFF),
           (guint8)(cur_addr & 0xFF),
-          0x01, 0x00 /* 256 words = 512 bytes */
+          (guint8)((words >> 8) & 0xFF),
+          (guint8)(words & 0xFF)
         };
 
         FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
         tx->short_is_error = TRUE;
-        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (sram_cmd, 6), 6, g_free);
-        fpi_usb_transfer_submit (tx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 dummy_tx_cb, NULL);
-
-        FpiUsbTransfer *rx = fpi_usb_transfer_new (FP_DEVICE (self));
-        rx->ssm = ssm;
-        fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 512);
-        fpi_usb_transfer_submit (rx, 500, fpi_device_get_cancellable (FP_DEVICE (self)),
-                                 read_chunk_cb, NULL);
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (sram_cmd, sizeof (sram_cmd)),
+                                         sizeof (sram_cmd), g_free);
+        fpi_usb_transfer_submit (tx, 1000, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 read_request_sent_cb, NULL);
       }
       break;
 

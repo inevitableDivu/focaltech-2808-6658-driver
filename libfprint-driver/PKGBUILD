@@ -1,7 +1,7 @@
 # Maintainer: Divyansh Pandey <pandeydivyansh070501@gmail.com>
 pkgname=libfprint-focaltech-6658
 pkgver=1.94.100
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers with FocalTech FW9366 (2808:6658) driver support"
 arch=('x86_64')
 url="https://fprint.freedesktop.org/"
@@ -45,7 +45,8 @@ prepare() {
 build() {
   arch-meson libfprint build \
     -D doc=false \
-    -D installed-tests=false
+    -D installed-tests=false \
+    -D drivers=all
   meson compile -C build
 }
 
