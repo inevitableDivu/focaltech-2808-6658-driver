@@ -138,7 +138,7 @@ class FocalTechSensor:
         st_80 = self.read_reg(0x80)
         fdt_data = self.read_sram(FW9366_FDT_ADDRESS, FW9366_FDT_VALUE_COUNT * 2)
         touch_vals = [(fdt_data[j] << 8) | fdt_data[j+1] for j in range(0, len(fdt_data), 2)]
-        touch = is_finger_touch(touch_vals)
+        touch = is_finger_touch(touch_vals, status=st_80)
         return touch, touch_vals, st_80
 
     def capture_image_frame(self):

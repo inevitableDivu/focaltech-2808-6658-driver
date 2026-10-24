@@ -32,6 +32,7 @@
 #define FDT_VALUE_COUNT 8
 #define FDT_BUF_SIZE    (FDT_VALUE_COUNT * 2)
 #define FDT_INVALID_SENTINEL 0x03FF
+#define FDT_INVALID_ALL_ONES 0xFFFF
 
 #define SCALE_FACTOR    4
 #define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
@@ -39,6 +40,7 @@
 #define SENSOR_PPMM     ((RAW_WIDTH * SCALE_FACTOR) / 3.2) /* Upsampled pixels per mm, using 3.2 mm active width */
 
 #define FDT_TOUCH_THRESHOLD    50
+#define FDT_READY_STATUS       0x50
 #define TOUCH_REQUIRED_STREAK  2
 #define MIN_DYNAMIC_RANGE      200
 #define POLL_INTERVAL_MS       60
@@ -52,6 +54,7 @@ enum {
   M_WAIT_POLL,
   M_FDT_TRIGGER,
   M_FDT_WAIT,
+  M_FDT_STATUS_REQ,
   M_FDT_READ,
   M_READ_CHUNK,
   M_EVALUATE_FDT,
@@ -75,6 +78,7 @@ struct _FpiDeviceFocaltech6658
   gsize         read_size;
   guint         read_complete_state;
   guint         touch_streak;
+  guint8        fdt_status;
   gsize         read_offset;
   guint         poll_count;
   gboolean      deactivating;
@@ -176,6 +180,64 @@ read_request_sent_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_dat
 }
 
 static void
+fdt_status_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+
+  if (error)
+    {
+      if (!self->deactivating)
+        g_warning ("[focaltech_6658] FDT status read failed: %s", error->message);
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (transfer->actual_length != 1)
+    {
+      GError *status_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                                  "Invalid FDT status response length");
+      fpi_ssm_mark_failed (transfer->ssm, status_error);
+      return;
+    }
+
+  self->fdt_status = transfer->buffer[0];
+  if (self->fdt_status != FDT_READY_STATUS)
+    {
+      self->touch_streak = 0;
+      self->poll_count++;
+      if (self->poll_count == 1 || self->poll_count % 10 == 0)
+        g_message ("[focaltech_6658] Skipping FDT sample: status=0x%02X (expected 0x%02X), poll=%u",
+                   self->fdt_status, FDT_READY_STATUS, self->poll_count);
+      fpi_ssm_jump_to_state (transfer->ssm, M_WAIT_POLL);
+      return;
+    }
+
+  fpi_ssm_jump_to_state (transfer->ssm, M_FDT_READ);
+}
+
+static void
+fdt_status_request_sent_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
+  FpiUsbTransfer *rx;
+
+  if (error)
+    {
+      if (!self->deactivating)
+        g_warning ("[focaltech_6658] FDT status request failed: %s", error->message);
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  rx = fpi_usb_transfer_new (FP_DEVICE (self));
+  rx->ssm = transfer->ssm;
+  rx->short_is_error = TRUE;
+  fpi_usb_transfer_fill_bulk (rx, FT_EP_IN, 1);
+  fpi_usb_transfer_submit (rx, 1000, fpi_device_get_cancellable (FP_DEVICE (self)),
+                           fdt_status_read_cb, NULL);
+}
+
+static void
 focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
@@ -233,6 +295,19 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       fpi_ssm_next_state_delayed (ssm, 5);
       break;
 
+    case M_FDT_STATUS_REQ:
+      {
+        static const guint8 pkt[] = { 0x08, 0xF7, 0x80, 0x00, 0x00 };
+        FpiUsbTransfer *tx = fpi_usb_transfer_new (FP_DEVICE (self));
+        tx->ssm = ssm;
+        tx->short_is_error = TRUE;
+        fpi_usb_transfer_fill_bulk_full (tx, FT_EP_OUT, g_memdup2 (pkt, sizeof (pkt)),
+                                         sizeof (pkt), g_free);
+        fpi_usb_transfer_submit (tx, 1000, fpi_device_get_cancellable (FP_DEVICE (self)),
+                                 fdt_status_request_sent_cb, NULL);
+      }
+      break;
+
     case M_FDT_READ:
       self->read_buf = self->fdt_buf;
       self->read_size = sizeof (self->fdt_buf);
@@ -245,8 +320,11 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       {
         guint16 deltas[FDT_VALUE_COUNT];
         guint16 max_delta = 0;
+        guint16 min_touch_delta = G_MAXUINT16;
+        guint16 max_touch_delta = 0;
         guint invalid_values = 0;
         guint valid_values = 0;
+        guint touch_values = 0;
 
         for (guint i = 0; i < FDT_VALUE_COUNT; i++)
           {
@@ -254,11 +332,12 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
                         self->fdt_buf[i * 2 + 1];
 
             /*
-             * Ignore the exact 0x03FF value seen in all channels during
-             * false-touch reports. It is not an upper bound: real readings
-             * from this hardware were observed above 1023.
+             * Ignore exact 0x03FF and 0xFFFF values seen in invalid-looking reports.
+             * These are empirical guards, not a vendor-confirmed encoding.
+             * 0x03FF is not an upper bound: real readings above 1023 were seen.
              */
-            if (deltas[i] == FDT_INVALID_SENTINEL)
+            if (deltas[i] == FDT_INVALID_SENTINEL ||
+                deltas[i] == FDT_INVALID_ALL_ONES)
               {
                 invalid_values++;
                 continue;
@@ -266,20 +345,29 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
 
             valid_values++;
             max_delta = MAX (max_delta, deltas[i]);
+            if (deltas[i] > FDT_TOUCH_THRESHOLD)
+              {
+                touch_values++;
+                min_touch_delta = MIN (min_touch_delta, deltas[i]);
+                max_touch_delta = MAX (max_touch_delta, deltas[i]);
+              }
           }
 
-        if (valid_values > 0 && max_delta > FDT_TOUCH_THRESHOLD)
+        if (touch_values >= 2 &&
+            min_touch_delta < max_touch_delta)
           self->touch_streak++;
         else
           self->touch_streak = 0;
 
         self->poll_count++;
         if (self->poll_count % 10 == 0 || self->touch_streak > 0)
-          g_message ("[focaltech_6658] FDT poll #%u: deltas=%u,%u,%u,%u,%u,%u,%u,%u max_valid=%u invalid=%u valid=%u streak=%u",
-                     self->poll_count,
+          g_message ("[focaltech_6658] FDT poll #%u: status=0x%02X deltas=%u,%u,%u,%u,%u,%u,%u,%u min_touch=%u max_touch=%u invalid=%u valid=%u active=%u streak=%u",
+                     self->poll_count, self->fdt_status,
                      deltas[0], deltas[1], deltas[2], deltas[3],
                      deltas[4], deltas[5], deltas[6], deltas[7],
-                     max_delta, invalid_values, valid_values, self->touch_streak);
+                     touch_values ? min_touch_delta : 0,
+                     max_touch_delta, invalid_values, valid_values,
+                     touch_values, self->touch_streak);
 
         if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
           {
