@@ -73,12 +73,11 @@ G_DECLARE_FINAL_TYPE (FpiDeviceFocaltech6658, fpi_device_focaltech_6658, FPI, DE
 G_DEFINE_TYPE (FpiDeviceFocaltech6658, fpi_device_focaltech_6658, FP_TYPE_IMAGE_DEVICE);
 
 static const FpIdEntry id_table[] = {
-  { .vid = 0x2808, .pid = 0x6658, },
-  { .vid = 0x2808, .pid = 0x9366, },
-  { .vid = 0x2808, .pid = 0x6652, },
-  { .vid = 0x2808, .pid = 0x9201, },
-  { .vid = 0, .pid = 0, .driver_data = 0 }
-};
+    {
+        .vid = 0x2808,
+        .pid = 0x6658,
+    },
+    {.vid = 0, .pid = 0, .driver_data = 0}};
 
 static int
 compare_u16 (const void *a, const void *b)

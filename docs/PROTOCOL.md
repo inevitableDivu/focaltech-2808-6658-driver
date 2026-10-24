@@ -7,7 +7,8 @@ This document details the reverse-engineered communication protocol, register sp
 ## 1. Hardware Architecture
 
 * **Vendor ID (VID):** `0x2808`
-* **Product ID (PID):** `0x6658` (Also compatible with `0x9366`, `0x6652`, `0x9201`)
+* **Product ID (PID):** `0x6658` (the only product ID registered by this driver)
+* **Other reported product IDs:** `0x9366`, `0x6652`, `0x9201` are unverified here and are not claimed as supported.
 * **USB Interface:** Interface `0` (Vendor Specific Class `0xFF`)
 * **Endpoints:**
   * `0x01` (EP 1 OUT, Bulk, Max Packet Size 512 bytes): Host-to-Device command & write stream

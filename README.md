@@ -15,8 +15,8 @@
 | :--- | :--- |
 | **USB Vendor ID** | `0x2808` (Realtek USB2.0 Finger Print Bridge) |
 | **USB Product ID** | `0x6658` (FocalTech Fingerprint Device) |
-| **Known Alternate PIDs** | `0x9366`, `0x6652`, `0x9201` |
-| **Compatible Chips** | FW9366, FW9391, FT9366, FT9201 |
+| **Other reported PIDs** | `0x9366`, `0x6652`, `0x9201` (unverified; not registered by this driver) |
+| **Reported chip families** | FW9366, FW9391, FT9366, FT9201 (not all verified; only USB ID `2808:6658` is registered) |
 | **Sensor Type** | Capacitive Touch / Imaging ($80 \times 64$ raw sensels, $\approx 3.2\text{ mm} \times 4.0\text{ mm}$) |
 | **Architecture** | Match-on-Host (Host-based minutiae extraction and matching) |
 
@@ -60,7 +60,8 @@ Reverse-engineering tiny capacitive match-on-host fingerprint sensors under Linu
 
 ```
 ├── docs/
-│   └── PROTOCOL.md             # Reverse-engineered USB protocol & architectural analysis
+│   ├── PROTOCOL.md             # Reverse-engineered USB protocol & architecture
+│   └── LINUX-SETUP.md          # Linux dependency, build, fprintd, and test guide
 ├── python/                     # Standalone Python user-space diagnostic tool
 │   ├── focaltech/
 │   │   ├── __init__.py
@@ -69,6 +70,8 @@ Reverse-engineering tiny capacitive match-on-host fingerprint sensors under Linu
 ├── libfprint-driver/           # Native C driver for libfprint & Arch PKGBUILD
 │   ├── focaltech_6658.c        # libfprint driver implementation
 │   └── PKGBUILD                # Arch Linux package build script
+├── scripts/                    # Linux setup, fprintd integration, and test helpers
+├── requirements.txt            # Python toolkit dependencies
 └── .gitignore                  # Excludes proprietary DLLs & biometric data
 ```
 
@@ -86,27 +89,29 @@ journalctl -u fprintd -b --no-pager
 
 A successful compile is not proof that enrollment works. The backend is experimental and must be tested on the exact sensor revision. Check the Meson summary for `focaltech_6658` and confirm that another system libfprint library is not shadowing the packaged build.
 
+For repeatable Linux dependency setup, a local upstream libfprint build, opt-in
+fprintd integration, and non-destructive testing scripts, see
+[`docs/LINUX-SETUP.md`](docs/LINUX-SETUP.md). The explicit integration option
+changes the fprintd service and device access rule; read its warnings before
+running it.
+
 ## 🚀 Testing with Python (Hardware Verification)
 
-### 1. Set Up `udev` Permissions
+### Python Diagnostic Toolkit
 ```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2808", ATTR{idProduct}=="6658", MODE="0666", GROUP="wheel"' | sudo tee /etc/udev/rules.d/70-focaltech.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger --attr-match=idVendor=2808
-```
+# Install supported Linux packages and create the project-local environment
+scripts/setup-linux.sh
 
-### 2. Install Dependencies
-```bash
-pip install pyusb numpy pillow
-```
-
-### 3. Run Diagnostic Tool
-```bash
 # Test real-time touch detection
-python python/cli.py --test
+.venv/bin/python python/cli.py --test
 
-# Capture a raw sensor frame
-python python/cli.py --capture test_frame.png
+# Capture a raw sensor frame (contains biometric data; keep it private)
+.venv/bin/python python/cli.py --capture private-frame.png
 ```
+
+The scripts do not install permissive USB permissions such as world-writable
+`0666` rules. See the setup guide for supported distributions and fprintd
+integration steps.
 
 ---
 

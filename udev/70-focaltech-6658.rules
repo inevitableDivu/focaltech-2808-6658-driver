@@ -1,0 +1,3 @@
+# Grant the active local seat access to the single USB ID registered by this driver.
+# This does not make the USB device world-writable.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2808", ATTR{idProduct}=="6658", TAG+="uaccess"
