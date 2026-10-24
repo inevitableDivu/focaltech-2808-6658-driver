@@ -87,6 +87,25 @@ Standard 3-byte command packets dispatched to the sensor:
 | `0x0200`..`0x29FF` (SRAM)| `FRAME_BUFFER` | $10,240$-byte raw capacitive matrix ($80 \times 64$ pixels) |
 | `0x1A05` (FIFO) | `SCAN_FIFO` | Streamed output of scanned matrix frame |
 
+The FocalTech Windows UMDF driver package (`2.0.4.91`) includes FW9366
+touch-detection code that selects `0x00B8` for its normal variant and
+`0x00E8` when an internal chip-variant marker is `0xAA`. The Linux Python
+diagnostic therefore reads eight 16-bit values from `0x00B8` for the
+registered FW9366 device. This mapping is based on static analysis of the
+vendor driver, not a live Windows USB trace.
+
+The native libfprint driver now enables FDT with register `0x9A = 0x5A`,
+triggers sensing with `[0xC2, 0x3D, 0x00]`, and reads the eight values from
+`0x00B8`. Status `0x54` on register `0x80` indicates scan completion, not
+finger presence. The current detector ignores saturated `0x03FF` readings,
+which were observed across all eight FDT values during false-touch reports;
+after two consecutive polls with a remaining value above 50, it disables FDT,
+switches to image mode, and captures the matrix from `0x0200`. This saturation
+filter is an evidence-based guard for the observed false positive, not a
+vendor-confirmed FDT rule. Validate the threshold and image capture against the
+physical sensor; only the FDT address selection has been confirmed by static
+analysis of the Windows driver.
+
 ---
 
 ## 5. Operational Sequences

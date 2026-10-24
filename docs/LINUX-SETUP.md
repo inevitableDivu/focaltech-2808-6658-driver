@@ -59,13 +59,16 @@ scripts/link-fprintd.sh --install-system
 ```
 
 The installer puts files under the isolated prefix
-`/opt/focaltech-6658-libfprint`, refuses to overwrite any existing file or
-symlink there, installs a narrowly scoped udev `uaccess` rule for
-2808:6658 (without setting world-writable permissions), reloads and retriggers that
-device, and adds a systemd drop-in that makes only fprintd preload the custom
+`/opt/focaltech-6658-libfprint` and refuses to overwrite existing files by
+default. To update an existing project install, run
+`scripts/link-fprintd.sh --install-system --update-existing`. This checks that
+the existing prefix has exactly the staged package layout, that non-library
+files and symlinks match, and that any existing integration files match this
+project before replacing the library. The installer installs a narrowly
+scoped udev `uaccess` rule for 2808:6658 (without setting world-writable
+permissions), reloads and retriggers that device, and adds a systemd drop-in that makes only fprintd preload the custom
 `/opt/focaltech-6658-libfprint/lib/libfprint-2.so.2`. It restarts fprintd only
-if its service is active. It refuses to overwrite existing files at the chosen
-udev-rule or systemd-drop-in paths. The system-wide option is intentionally opt-in; the
+if its service is active. The system-wide option is intentionally opt-in; the
 library is outside general linker directories and the drop-in targets fprintd
 only. Review the staged contents and your distribution's libfprint/fprintd
 packaging before installing. Do not use this prototype on a machine where

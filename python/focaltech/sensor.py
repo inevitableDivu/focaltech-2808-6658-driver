@@ -9,6 +9,11 @@ import numpy as np
 
 VID = 0x2808
 PID = 0x6658
+FW9366_FDT_ADDRESS = 0x00B8
+FW9366_FDT_VALUE_COUNT = 8
+FDT_TOUCH_THRESHOLD = 50
+FDT_SATURATED_VALUE = 0x03FF
+IMAGE_FRAME_ADDRESS = 0x0200
 
 CMD_RESET     = bytes([0xC0, 0x3F, 0x00])
 CMD_FDT_SENSE = bytes([0xC2, 0x3D, 0x00])
@@ -119,9 +124,13 @@ class FocalTechSensor:
         self.send_cmd(CMD_FDT_SENSE)
         time.sleep(0.005)
         st_80 = self.read_reg(0x80)
-        fdt_data = self.read_sram(0x00E8, 8)
-        touch_vals = [(fdt_data[j] << 8) | fdt_data[j+1] for j in range(0, 8, 2)]
-        return st_80 == 0x54 or any(v > 50 for v in touch_vals), touch_vals
+        fdt_data = self.read_sram(FW9366_FDT_ADDRESS, FW9366_FDT_VALUE_COUNT * 2)
+        touch_vals = [(fdt_data[j] << 8) | fdt_data[j+1] for j in range(0, len(fdt_data), 2)]
+        has_valid_delta = any(v < FDT_SATURATED_VALUE for v in touch_vals)
+        touch = has_valid_delta and any(
+            FDT_TOUCH_THRESHOLD < v < FDT_SATURATED_VALUE for v in touch_vals
+        )
+        return touch, touch_vals, st_80
 
     def capture_image_frame(self):
         self.disable_finger_detect()
@@ -137,7 +146,7 @@ class FocalTechSensor:
                 break
             time.sleep(0.002)
 
-        raw_data = self.read_sram_bulk(0x0000, 10240)
+        raw_data = self.read_sram_bulk(IMAGE_FRAME_ADDRESS, 10240)
         pixels = []
         for i in range(0, len(raw_data), 2):
             px = (raw_data[i] << 8) | raw_data[i+1]

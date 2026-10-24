@@ -12,18 +12,22 @@ readonly SYSTEMD_DROPIN_DEST="/etc/systemd/system/fprintd.service.d/90-focaltech
 STAGE_DIR=""
 
 INSTALL_SYSTEM=0
+UPDATE_EXISTING=0
 DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/link-fprintd.sh [--install-system] [--dry-run]
+Usage: scripts/link-fprintd.sh [--install-system] [--update-existing] [--dry-run]
 
 Stage the project's libfprint build and, only when explicitly requested, install
 its files under /opt/focaltech-6658-libfprint so the system fprintd daemon can
-load the custom driver. Existing files in that prefix are never overwritten.
+load the custom driver. Existing files are not overwritten unless
+--update-existing is explicitly requested and the current installation matches
+the expected project layout.
 
 Options:
   --install-system  Perform the system-wide install and configure fprintd
+  --update-existing Update a matching existing project install (requires --install-system)
   --dry-run         Print what would be done
   -h, --help        Show this help
 
@@ -36,12 +40,18 @@ EOF
 while (($#)); do
   case "$1" in
     --install-system) INSTALL_SYSTEM=1 ;;
+    --update-existing) UPDATE_EXISTING=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if (( UPDATE_EXISTING && ! INSTALL_SYSTEM )); then
+  printf 'Error: --update-existing requires --install-system.\n' >&2
+  exit 2
+fi
 
 if (( DRY_RUN )); then
   if [[ -f "$BUILD_DIR/build.ninja" ]]; then
@@ -50,8 +60,13 @@ if (( DRY_RUN )); then
     printf 'No build found at %s; run scripts/setup-linux.sh before staging.\n' "$BUILD_DIR"
   fi
   if (( INSTALL_SYSTEM )); then
-    printf 'Would install non-conflicting files under %s, configure fprintd to preload the custom library, add a per-device uaccess rule, refresh systemd/udev state, and restart fprintd if active.\n' \
-      "$INSTALL_ROOT"
+    if (( UPDATE_EXISTING )); then
+      printf 'Would verify and update the existing project install under %s, then refresh fprintd integration and restart fprintd if active.\n' \
+        "$INSTALL_ROOT"
+    else
+      printf 'Would install non-conflicting files under %s, configure fprintd to preload the custom library, add a per-device uaccess rule, refresh systemd/udev state, and restart fprintd if active.\n' \
+        "$INSTALL_ROOT"
+    fi
   else
     printf 'No system changes requested. Re-run with --install-system to install.\n'
   fi
@@ -97,24 +112,72 @@ if [[ ! -d "$STAGE_DIR$INSTALL_ROOT" ]]; then
   exit 1
 fi
 
-while IFS= read -r -d '' staged_path; do
-  relative_path="${staged_path#"$STAGE_DIR$INSTALL_ROOT/"}"
-  destination="$INSTALL_ROOT/$relative_path"
-  if [[ -e "$destination" || -L "$destination" ]]; then
-    printf 'Error: refusing to overwrite existing path: %s\n' "$destination" >&2
+if (( UPDATE_EXISTING )); then
+  if [[ ! -d "$INSTALL_ROOT" ]]; then
+    printf 'Error: --update-existing requested, but no existing install directory was found at %s.\n' \
+      "$INSTALL_ROOT" >&2
     exit 1
   fi
-done < <(find "$STAGE_DIR$INSTALL_ROOT" \( -type f -o -type l \) -print0)
 
-if [[ -e "$UDEV_RULE_DEST" || -L "$UDEV_RULE_DEST" ]]; then
-  printf 'Error: refusing to overwrite existing udev rule: %s\n' "$UDEV_RULE_DEST" >&2
-  exit 1
+  if ! diff -u \
+      <(cd "$STAGE_DIR$INSTALL_ROOT" && find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort) \
+      <(cd "$INSTALL_ROOT" && find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort); then
+    printf 'Error: existing install layout does not match the staged project package; refusing update.\n' >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d '' staged_path; do
+    relative_path="${staged_path#"$STAGE_DIR$INSTALL_ROOT/"}"
+    destination="$INSTALL_ROOT/$relative_path"
+
+    if [[ -L "$staged_path" ]]; then
+      if [[ ! -L "$destination" ]] || [[ "$(readlink -- "$staged_path")" != "$(readlink -- "$destination")" ]]; then
+        printf 'Error: existing symlink differs from the staged project install: %s\n' \
+          "$destination" >&2
+        exit 1
+      fi
+    elif [[ "$relative_path" != lib/libfprint-2.so && \
+            "$relative_path" != lib/libfprint-2.so.2.0.0 && \
+            "$relative_path" != lib/libfprint-2.so.2 ]]; then
+      if [[ ! -f "$destination" ]] || ! cmp -s -- "$staged_path" "$destination"; then
+        printf 'Error: existing file differs from the staged project install: %s\n' \
+          "$destination" >&2
+        exit 1
+      fi
+    fi
+  done < <(find "$STAGE_DIR$INSTALL_ROOT" \( -type f -o -type l \) -print0)
+else
+  while IFS= read -r -d '' staged_path; do
+    relative_path="${staged_path#"$STAGE_DIR$INSTALL_ROOT/"}"
+    destination="$INSTALL_ROOT/$relative_path"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      printf 'Error: refusing to overwrite existing path: %s\n' "$destination" >&2
+      printf 'If this is the existing project install, review it and rerun with --update-existing.\n' >&2
+      exit 1
+    fi
+  done < <(find "$STAGE_DIR$INSTALL_ROOT" \( -type f -o -type l \) -print0)
 fi
-if [[ -e "$SYSTEMD_DROPIN_DEST" || -L "$SYSTEMD_DROPIN_DEST" ]]; then
-  printf 'Error: refusing to overwrite existing fprintd systemd drop-in: %s\n' \
-    "$SYSTEMD_DROPIN_DEST" >&2
-  exit 1
-fi
+
+for config_pair in \
+  "$UDEV_RULE_SOURCE:$UDEV_RULE_DEST" \
+  "$SYSTEMD_DROPIN_SOURCE:$SYSTEMD_DROPIN_DEST"; do
+  config_source="${config_pair%%:*}"
+  config_destination="${config_pair#*:}"
+  if [[ -e "$config_destination" || -L "$config_destination" ]]; then
+    if (( ! UPDATE_EXISTING )); then
+      printf 'Error: refusing to overwrite existing integration file: %s\n' \
+        "$config_destination" >&2
+      printf 'If this is the existing project integration, rerun with --update-existing.\n' >&2
+      exit 1
+    fi
+    if [[ ! -f "$config_destination" ]] || ! cmp -s -- "$config_source" "$config_destination"; then
+      printf 'Error: existing integration file differs from the project version: %s\n' \
+        "$config_destination" >&2
+      exit 1
+    fi
+  fi
+done
+
 if [[ ! -e "$STAGE_DIR$INSTALL_ROOT/lib/libfprint-2.so.2" ]]; then
   printf 'Error: staged library not found at %s%s/lib/libfprint-2.so.2.\n' \
     "$STAGE_DIR" "$INSTALL_ROOT" >&2
@@ -122,7 +185,11 @@ if [[ ! -e "$STAGE_DIR$INSTALL_ROOT/lib/libfprint-2.so.2" ]]; then
   exit 1
 fi
 
-sudo cp -a -n "$STAGE_DIR$INSTALL_ROOT/." "$INSTALL_ROOT/"
+if (( UPDATE_EXISTING )); then
+  sudo cp -a "$STAGE_DIR$INSTALL_ROOT/." "$INSTALL_ROOT/"
+else
+  sudo cp -a -n "$STAGE_DIR$INSTALL_ROOT/." "$INSTALL_ROOT/"
+fi
 sudo install -D -m 0644 "$UDEV_RULE_SOURCE" "$UDEV_RULE_DEST"
 sudo install -D -m 0644 "$SYSTEMD_DROPIN_SOURCE" "$SYSTEMD_DROPIN_DEST"
 

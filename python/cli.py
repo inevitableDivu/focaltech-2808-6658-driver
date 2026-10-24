@@ -21,9 +21,9 @@ def main():
         print("Enabling Finger Detection Mode. Touch the sensor now!")
         sensor.enable_finger_detect()
         for i in range(1, 21):
-            touch, vals = sensor.is_finger_present()
-            status = ">>> FINGER DETECTED! <<<" if touch else "Idle"
-            print(f"[{i:2d}/20] Touch={touch} (Deltas={vals}) --> {status}")
+            touch, vals, status = sensor.is_finger_present()
+            message = ">>> FINGER DETECTED! <<<" if touch else "Idle"
+            print(f"[{i:2d}/20] Reg80=0x{status:02X} Touch={touch} (Deltas={vals}) --> {message}")
             time.sleep(0.3)
         sensor.disable_finger_detect()
 

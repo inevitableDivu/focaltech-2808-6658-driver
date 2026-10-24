@@ -28,30 +28,39 @@
 #define RAW_PIXELS      (RAW_WIDTH * RAW_HEIGHT)
 #define RAW_BUF_SIZE    (RAW_PIXELS * 2)
 #define SRAM_FRAME_BASE 0x0200
+#define SRAM_FDT_BASE   0x00B8
+#define FDT_VALUE_COUNT 8
+#define FDT_BUF_SIZE    (FDT_VALUE_COUNT * 2)
+#define FDT_SATURATED_VALUE 0x03FF
 
 #define SCALE_FACTOR    4
 #define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
 #define IMAGE_HEIGHT    (RAW_HEIGHT * SCALE_FACTOR)
 #define SENSOR_PPMM     ((RAW_WIDTH * SCALE_FACTOR) / 3.2) /* Upsampled pixels per mm, using 3.2 mm active width */
 
-#define TOUCH_DIFF_THRESHOLD   75
-#define TOUCH_MIN_SENSELS      15
+#define FDT_TOUCH_THRESHOLD    50
 #define TOUCH_REQUIRED_STREAK  2
 #define MIN_DYNAMIC_RANGE      200
 #define POLL_INTERVAL_MS       60
-#define BASELINE_WARMUP_CYCLES 3
 
 /* State machine states */
 enum {
   M_INIT_REG,
   M_INIT_WAKE,
   M_INIT_LOCK,
+  M_ENABLE_FDT,
+  M_WAIT_POLL,
+  M_FDT_TRIGGER,
+  M_FDT_WAIT,
+  M_FDT_READ,
+  M_READ_CHUNK,
+  M_EVALUATE_FDT,
+  M_DISABLE_FDT,
   M_INIT_CFG_1801,
   M_INIT_CFG_1800,
-  M_WAIT_POLL,
   M_SCAN_TRIGGER,
   M_SCAN_WAIT,
-  M_READ_CHUNK,
+  M_FRAME_READ,
   M_EVALUATE_FRAME,
   M_NUM_STATES,
 };
@@ -61,8 +70,10 @@ struct _FpiDeviceFocaltech6658
   FpImageDevice parent;
   FpiSsm       *ssm;
   guint8       *frame_buf;
-  gfloat       *baseline_buf;
-  guint         warmup_count;
+  guint8        fdt_buf[FDT_BUF_SIZE];
+  guint8       *read_buf;
+  gsize         read_size;
+  guint         read_complete_state;
   guint         touch_streak;
   gsize         read_offset;
   guint         poll_count;
@@ -112,7 +123,7 @@ read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GErr
       return;
     }
 
-  bytes_left = RAW_BUF_SIZE - self->read_offset;
+  bytes_left = self->read_size - self->read_offset;
   if (transfer->actual_length == 0 || transfer->actual_length > bytes_left)
     {
       GError *read_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -121,11 +132,11 @@ read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GErr
       return;
     }
 
-  memcpy (self->frame_buf + self->read_offset, transfer->buffer, transfer->actual_length);
+  memcpy (self->read_buf + self->read_offset, transfer->buffer, transfer->actual_length);
   self->read_offset += transfer->actual_length;
 
-  if (self->read_offset >= RAW_BUF_SIZE)
-    fpi_ssm_jump_to_state (transfer->ssm, M_EVALUATE_FRAME);
+  if (self->read_offset >= self->read_size)
+    fpi_ssm_jump_to_state (transfer->ssm, self->read_complete_state);
   else
     fpi_ssm_jump_to_state (transfer->ssm, M_READ_CHUNK);
 }
@@ -147,11 +158,11 @@ read_request_sent_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_dat
       return;
     }
 
-  bytes_left = RAW_BUF_SIZE - self->read_offset;
+  bytes_left = self->read_size - self->read_offset;
   chunk_size = MIN ((gsize) 512, bytes_left);
   if (chunk_size == 0)
     {
-      fpi_ssm_jump_to_state (transfer->ssm, M_EVALUATE_FRAME);
+      fpi_ssm_jump_to_state (transfer->ssm, self->read_complete_state);
       return;
     }
 
@@ -196,6 +207,89 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
+    case M_ENABLE_FDT:
+      {
+        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x5A };
+        g_message ("[focaltech_6658] Enabling FW9366 finger detection at SRAM 0x%04X",
+                   SRAM_FDT_BASE);
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case M_WAIT_POLL:
+      fpi_ssm_next_state_delayed (ssm, POLL_INTERVAL_MS);
+      break;
+
+    case M_FDT_TRIGGER:
+      {
+        static const guint8 pkt[] = { 0xC2, 0x3D, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
+    case M_FDT_WAIT:
+      fpi_ssm_next_state_delayed (ssm, 5);
+      break;
+
+    case M_FDT_READ:
+      self->read_buf = self->fdt_buf;
+      self->read_size = sizeof (self->fdt_buf);
+      self->read_offset = 0;
+      self->read_complete_state = M_EVALUATE_FDT;
+      fpi_ssm_jump_to_state (ssm, M_READ_CHUNK);
+      break;
+
+    case M_EVALUATE_FDT:
+      {
+        guint16 deltas[FDT_VALUE_COUNT];
+        guint16 max_delta = 0;
+        guint saturated_values = 0;
+
+        for (guint i = 0; i < FDT_VALUE_COUNT; i++)
+          {
+            deltas[i] = ((guint16) self->fdt_buf[i * 2] << 8) |
+                        self->fdt_buf[i * 2 + 1];
+            if (deltas[i] == FDT_SATURATED_VALUE)
+              saturated_values++;
+            else if (deltas[i] < FDT_SATURATED_VALUE)
+              max_delta = MAX (max_delta, deltas[i]);
+          }
+
+        if (max_delta > FDT_TOUCH_THRESHOLD)
+          self->touch_streak++;
+        else
+          self->touch_streak = 0;
+
+        self->poll_count++;
+        if (self->poll_count % 10 == 0 || self->touch_streak > 0)
+          g_message ("[focaltech_6658] FDT poll #%u: deltas=%u,%u,%u,%u,%u,%u,%u,%u max_valid=%u saturated=%u streak=%u",
+                     self->poll_count,
+                     deltas[0], deltas[1], deltas[2], deltas[3],
+                     deltas[4], deltas[5], deltas[6], deltas[7],
+                     max_delta, saturated_values, self->touch_streak);
+
+        if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
+          {
+            g_message ("[focaltech_6658] Finger detected by FW9366 FDT (max_delta=%u); capturing image",
+                       max_delta);
+            self->touch_streak = 0;
+            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+            fpi_ssm_next_state (ssm);
+          }
+        else
+          {
+            fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
+          }
+      }
+      break;
+
+    case M_DISABLE_FDT:
+      {
+        static const guint8 pkt[] = { 0x09, 0xF6, 0x9A, 0x00 };
+        ft_send_bulk_cmd (self, pkt, sizeof (pkt));
+      }
+      break;
+
     case M_INIT_CFG_1801:
       {
         static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x01, 0x00, 0x01, 0xA7, 0xFC };
@@ -206,17 +300,12 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
     case M_INIT_CFG_1800:
       {
         static const guint8 pkt[] = { 0x05, 0xFA, 0x98, 0x00, 0x00, 0x01, 0xFE, 0x4F };
-        g_message ("[focaltech_6658] Continuous matrix scanning active");
+        g_message ("[focaltech_6658] Configuring image capture after FDT detection");
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
       }
       break;
 
-    case M_WAIT_POLL:
-      fpi_ssm_next_state_delayed (ssm, POLL_INTERVAL_MS);
-      break;
-
     case M_SCAN_TRIGGER:
-      self->read_offset = 0;
       {
         static const guint8 pkt[] = { 0xC4, 0x3B, 0x00 };
         ft_send_bulk_cmd (self, pkt, sizeof (pkt));
@@ -227,10 +316,21 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       fpi_ssm_next_state_delayed (ssm, 35);
       break;
 
+    case M_FRAME_READ:
+      {
+        self->read_buf = self->frame_buf;
+        self->read_size = RAW_BUF_SIZE;
+        self->read_offset = 0;
+        self->read_complete_state = M_EVALUATE_FRAME;
+        fpi_ssm_jump_to_state (ssm, M_READ_CHUNK);
+      }
+      break;
+
     case M_READ_CHUNK:
       {
-        guint16 cur_addr = (guint16) (SRAM_FRAME_BASE + self->read_offset);
-        gsize bytes_left = RAW_BUF_SIZE - self->read_offset;
+        guint16 cur_addr = (guint16) ((self->read_complete_state == M_EVALUATE_FDT ?
+                                      SRAM_FDT_BASE : SRAM_FRAME_BASE) + self->read_offset);
+        gsize bytes_left = self->read_size - self->read_offset;
         guint16 words = (guint16) (MIN ((gsize) 512, bytes_left) / 2);
         guint8 sram_cmd[6] = {
           0x04, 0xFB,
@@ -256,146 +356,76 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
         for (int i = 0; i < RAW_PIXELS; i++)
           cur_pixels[i] = (self->frame_buf[i * 2] << 8) | self->frame_buf[i * 2 + 1];
 
-        if (self->warmup_count < BASELINE_WARMUP_CYCLES)
+        /* Contrast stretch raw matrix across active range (2nd to 98th percentile) */
+        guint16 *sorted = g_memdup2 (cur_pixels, RAW_PIXELS * sizeof (guint16));
+        qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
+        guint16 p_low  = sorted[(RAW_PIXELS * 2) / 100];
+        guint16 p_high = sorted[(RAW_PIXELS * 98) / 100];
+        g_free (sorted);
+
+        guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
+
+        /* Quality / Dynamic Range Gate: Reject flat noise or low contrast frames */
+        if (range < MIN_DYNAMIC_RANGE)
           {
-            for (int i = 0; i < RAW_PIXELS; i++)
-              {
-                if (self->warmup_count == 0)
-                  self->baseline_buf[i] = (gfloat) cur_pixels[i];
-                else
-                  self->baseline_buf[i] = self->baseline_buf[i] * 0.7f + (gfloat) cur_pixels[i] * 0.3f;
-              }
-            self->warmup_count++;
+            g_message ("[focaltech_6658] Frame rejected (low dynamic range=%u < %u). Re-polling...",
+                       range, MIN_DYNAMIC_RANGE);
             g_free (cur_pixels);
-            fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
+            fpi_ssm_jump_to_state (ssm, M_INIT_REG);
             return;
           }
 
-        /* Calculate delta vs EMA baseline */
-        gfloat max_diff = 0;
-        guint touch_count = 0;
-        gfloat sum_diff = 0;
-        guint valid_count = 0;
-
+        guint8 *raw_norm = g_malloc (RAW_PIXELS);
         for (int i = 0; i < RAW_PIXELS; i++)
           {
-            gfloat b = self->baseline_buf[i];
-            gfloat c = (gfloat) cur_pixels[i];
-            if (b < 50000.0f && c < 50000.0f)
-              {
-                gfloat diff = (c > b) ? (c - b) : (b - c);
-                if (diff > max_diff) max_diff = diff;
-                if (diff > 50.0f) touch_count++;
-                sum_diff += diff;
-                valid_count++;
-              }
+            guint16 px = cur_pixels[i];
+            if (px < p_low) px = p_low;
+            if (px > p_high) px = p_high;
+            raw_norm[i] = (guint8)(((guint32)(px - p_low) * 255) / range);
           }
-
-        gfloat mean_energy = (valid_count > 0) ? (sum_diff / (gfloat) valid_count) : 0;
-        gboolean is_touching = (max_diff > (gfloat) TOUCH_DIFF_THRESHOLD && touch_count >= TOUCH_MIN_SENSELS) ||
-                               (mean_energy > 4.0f);
-
-        if (is_touching)
-          self->touch_streak++;
-        else
-          self->touch_streak = 0;
-
-        self->poll_count++;
-        if (self->poll_count % 10 == 0 || self->touch_streak > 0)
-          {
-            g_message ("[focaltech_6658] Matrix poll #%u: active_sensels=%u, max_diff=%.1f, mean=%.2f, streak=%u",
-                       self->poll_count, touch_count, max_diff, mean_energy, self->touch_streak);
-          }
-
-        if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
-          {
-            /* Contrast stretch raw matrix across active range (2nd to 98th percentile) */
-            guint16 *sorted = g_memdup2 (cur_pixels, RAW_PIXELS * sizeof (guint16));
-            qsort (sorted, RAW_PIXELS, sizeof (guint16), compare_u16);
-            guint16 p_low  = sorted[(RAW_PIXELS * 2) / 100];
-            guint16 p_high = sorted[(RAW_PIXELS * 98) / 100];
-            g_free (sorted);
-
-            guint32 range = (p_high > p_low) ? (p_high - p_low) : 1;
-
-            /* Quality / Dynamic Range Gate: Reject flat noise or low contrast frames */
-            if (range < MIN_DYNAMIC_RANGE)
-              {
-                g_message ("[focaltech_6658] Frame rejected (low dynamic range=%u < %u). Re-polling...",
-                           range, MIN_DYNAMIC_RANGE);
-                g_free (cur_pixels);
-                fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
-                return;
-              }
-
-            g_message ("[focaltech_6658] *** VERIFIED PHYSICAL FINGER TOUCH DETECTED! (streak=%u, sensels=%u, range=%u) ***",
-                       self->touch_streak, touch_count, range);
-
-            self->touch_streak = 0;
-            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
-
-            guint8 *raw_norm = g_malloc (RAW_PIXELS);
-            for (int i = 0; i < RAW_PIXELS; i++)
-              {
-                guint16 px = cur_pixels[i];
-                if (px < p_low) px = p_low;
-                if (px > p_high) px = p_high;
-                raw_norm[i] = (guint8)(((guint32)(px - p_low) * 255) / range);
-              }
-            g_free (cur_pixels);
-
-            /* Create NIST-optimized image with 4x Smooth 2D Bilinear Upscaling to 256x320 */
-            FpImage *img = fp_image_new (IMAGE_WIDTH, IMAGE_HEIGHT);
-            img->ppmm = SENSOR_PPMM;
-            img->flags = FPI_IMAGE_COLORS_INVERTED;
-
-            for (int y = 0; y < IMAGE_HEIGHT; y++)
-              {
-                float gy = (float) y / (float) SCALE_FACTOR;
-                int y0 = (int) gy;
-                int y1 = (y0 + 1 < RAW_HEIGHT) ? (y0 + 1) : y0;
-                float dy = gy - y0;
-
-                for (int x = 0; x < IMAGE_WIDTH; x++)
-                  {
-                    float gx = (float) x / (float) SCALE_FACTOR;
-                    int x0 = (int) gx;
-                    int x1 = (x0 + 1 < RAW_WIDTH) ? (x0 + 1) : x0;
-                    float dx = gx - x0;
-
-                    float v00 = raw_norm[y0 * RAW_WIDTH + x0];
-                    float v01 = raw_norm[y0 * RAW_WIDTH + x1];
-                    float v10 = raw_norm[y1 * RAW_WIDTH + x0];
-                    float v11 = raw_norm[y1 * RAW_WIDTH + x1];
-
-                    float v = (1.0f - dx) * (1.0f - dy) * v00 +
-                              dx * (1.0f - dy) * v01 +
-                              (1.0f - dx) * dy * v10 +
-                              dx * dy * v11;
-
-                    img->data[y * IMAGE_WIDTH + x] = (guint8) v;
-                  }
-              }
-            g_free (raw_norm);
-
-            g_message ("[focaltech_6658] Frame delivered to mindtct: p2=%d, p98=%d, dim=%dx%d, ppmm=%.2f",
-                       p_low, p_high, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
-
-            fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
-            fpi_ssm_mark_completed (ssm);
-            fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
-            return;
-          }
-
-        /* Update EMA baseline when no touch */
-        if (!is_touching)
-          {
-            for (int i = 0; i < RAW_PIXELS; i++)
-              self->baseline_buf[i] = self->baseline_buf[i] * 0.85f + (gfloat) cur_pixels[i] * 0.15f;
-          }
-
         g_free (cur_pixels);
-        fpi_ssm_jump_to_state (ssm, M_WAIT_POLL);
+
+        /* Create NIST-optimized image with 4x Smooth 2D Bilinear Upscaling to 256x320 */
+        FpImage *img = fp_image_new (IMAGE_WIDTH, IMAGE_HEIGHT);
+        img->ppmm = SENSOR_PPMM;
+        img->flags = FPI_IMAGE_COLORS_INVERTED;
+
+        for (int y = 0; y < IMAGE_HEIGHT; y++)
+          {
+            float gy = (float) y / (float) SCALE_FACTOR;
+            int y0 = (int) gy;
+            int y1 = (y0 + 1 < RAW_HEIGHT) ? (y0 + 1) : y0;
+            float dy = gy - y0;
+
+            for (int x = 0; x < IMAGE_WIDTH; x++)
+              {
+                float gx = (float) x / (float) SCALE_FACTOR;
+                int x0 = (int) gx;
+                int x1 = (x0 + 1 < RAW_WIDTH) ? (x0 + 1) : x0;
+                float dx = gx - x0;
+
+                float v00 = raw_norm[y0 * RAW_WIDTH + x0];
+                float v01 = raw_norm[y0 * RAW_WIDTH + x1];
+                float v10 = raw_norm[y1 * RAW_WIDTH + x0];
+                float v11 = raw_norm[y1 * RAW_WIDTH + x1];
+
+                float v = (1.0f - dx) * (1.0f - dy) * v00 +
+                          dx * (1.0f - dy) * v01 +
+                          (1.0f - dx) * dy * v10 +
+                          dx * dy * v11;
+
+                img->data[y * IMAGE_WIDTH + x] = (guint8) v;
+              }
+          }
+        g_free (raw_norm);
+
+        g_message ("[focaltech_6658] Frame delivered to mindtct: p2=%d, p98=%d, dim=%dx%d, ppmm=%.2f",
+                   p_low, p_high, IMAGE_WIDTH, IMAGE_HEIGHT, img->ppmm);
+
+        fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), img);
+        fpi_ssm_mark_completed (ssm);
+        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+        return;
       }
       break;
     }
@@ -429,8 +459,6 @@ focaltech_dev_open (FpImageDevice *dev)
     }
 
   self->frame_buf = g_malloc0 (RAW_BUF_SIZE);
-  self->baseline_buf = g_malloc0 (RAW_PIXELS * sizeof (gfloat));
-  self->warmup_count = 0;
   self->touch_streak = 0;
   self->poll_count = 0;
   fpi_image_device_open_complete (dev, NULL);
@@ -445,7 +473,6 @@ focaltech_dev_close (FpImageDevice *dev)
   GError *error = NULL;
 
   g_clear_pointer (&self->frame_buf, g_free);
-  g_clear_pointer (&self->baseline_buf, g_free);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
   fpi_image_device_close_complete (dev, error);
   g_message ("[focaltech_6658] Device closed");
@@ -457,7 +484,6 @@ focaltech_dev_activate (FpImageDevice *dev)
 {
   FpiDeviceFocaltech6658 *self = FPI_DEVICE_FOCALTECH_6658 (dev);
   self->deactivating = FALSE;
-  self->warmup_count = 0;
   self->touch_streak = 0;
   g_message ("[focaltech_6658] Device activated");
   fpi_image_device_activate_complete (dev, NULL);
@@ -490,7 +516,6 @@ focaltech_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
   if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
     {
-      self->warmup_count = 0;
       self->touch_streak = 0;
       if (!self->ssm)
         {
