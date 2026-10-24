@@ -7,12 +7,12 @@ import usb.core
 import usb.util
 import numpy as np
 
+from .fdt import is_finger_touch
+
 VID = 0x2808
 PID = 0x6658
 FW9366_FDT_ADDRESS = 0x00B8
 FW9366_FDT_VALUE_COUNT = 8
-FDT_TOUCH_THRESHOLD = 50
-FDT_SATURATED_VALUE = 0x03FF
 IMAGE_FRAME_ADDRESS = 0x0200
 
 CMD_RESET     = bytes([0xC0, 0x3F, 0x00])
@@ -83,6 +83,9 @@ class FocalTechSensor:
         return (res[0] << 8) | res[1]
 
     def read_sram(self, addr, byte_len):
+        if byte_len <= 0 or byte_len % 2:
+            raise ValueError("SRAM reads must request a positive, even byte length")
+
         words = byte_len // 2
         addr_hi = ((addr >> 8) | 0x80) & 0xFF
         addr_lo = addr & 0xFF
@@ -90,7 +93,16 @@ class FocalTechSensor:
         words_lo = words & 0xFF
         pkt = bytes([0x04, 0xFB, addr_hi, addr_lo, words_hi, words_lo])
         self.dev.write(self.ep_out, pkt, timeout=1000)
-        return list(self.dev.read(self.ep_in, byte_len, timeout=1000))
+        data = self.dev.read(self.ep_in, byte_len, timeout=1000)
+
+        # Do not interpret a partial USB response as a complete 16-bit sample.
+        if len(data) != byte_len:
+            raise RuntimeError(
+                f"Short SRAM read at 0x{addr:04X}: expected {byte_len} bytes, "
+                f"received {len(data)}"
+            )
+
+        return list(data)
 
     def read_sram_bulk(self, addr, byte_len):
         buf = bytearray()
@@ -126,10 +138,7 @@ class FocalTechSensor:
         st_80 = self.read_reg(0x80)
         fdt_data = self.read_sram(FW9366_FDT_ADDRESS, FW9366_FDT_VALUE_COUNT * 2)
         touch_vals = [(fdt_data[j] << 8) | fdt_data[j+1] for j in range(0, len(fdt_data), 2)]
-        has_valid_delta = any(v < FDT_SATURATED_VALUE for v in touch_vals)
-        touch = has_valid_delta and any(
-            FDT_TOUCH_THRESHOLD < v < FDT_SATURATED_VALUE for v in touch_vals
-        )
+        touch = is_finger_touch(touch_vals)
         return touch, touch_vals, st_80
 
     def capture_image_frame(self):

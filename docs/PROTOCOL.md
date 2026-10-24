@@ -94,17 +94,26 @@ diagnostic therefore reads eight 16-bit values from `0x00B8` for the
 registered FW9366 device. This mapping is based on static analysis of the
 vendor driver, not a live Windows USB trace.
 
-The native libfprint driver now enables FDT with register `0x9A = 0x5A`,
-triggers sensing with `[0xC2, 0x3D, 0x00]`, and reads the eight values from
-`0x00B8`. Status `0x54` on register `0x80` indicates scan completion, not
-finger presence. The current detector ignores saturated `0x03FF` readings,
-which were observed across all eight FDT values during false-touch reports;
-after two consecutive polls with a remaining value above 50, it disables FDT,
-switches to image mode, and captures the matrix from `0x0200`. This saturation
-filter is an evidence-based guard for the observed false positive, not a
-vendor-confirmed FDT rule. Validate the threshold and image capture against the
-physical sensor; only the FDT address selection has been confirmed by static
-analysis of the Windows driver.
+The native libfprint driver enables FDT with register `0x9A = 0x5A`,
+triggers sensing with [`0xC2, 0x3D, 0x00`], and reads eight values from
+`0x00B8`. Status `0x54` on register `0x80` is not accepted as proof of a
+finger. An earlier Python hardware run returned deltas
+`[3098, 3061, 3048, 2952, 2972, 3188, 3158, 877]`; therefore, `0x03FF`
+cannot safely be assumed to be the maximum possible delta. The updated detector
+ignores only values exactly equal to `0x03FF` (an invalid/sentinel pattern
+observed in false-touch reports), while allowing larger 16-bit readings. It
+requires two consecutive polls with at least one non-sentinel value above 50
+before capturing an image from `0x0200`.
+
+This is a corrective hypothesis based on the captured values, not a vendor-
+confirmed meaning for `0x03FF`. Short Python SRAM reads now fail explicitly
+instead of being parsed as a complete sample. If the sensor still alternates
+between zero and previously observed values, capture USB traffic and verify
+which response/status marks a fresh FDT sample; repeated-equal data alone
+cannot prove staleness because the first reported hardware run also repeated
+its values while detecting a touch. Validate the threshold and image capture
+against the physical sensor. The `0x00B8` / `0x00E8` variant choice is based
+on static analysis of the Windows driver, not a live Windows USB trace.
 
 ---
 

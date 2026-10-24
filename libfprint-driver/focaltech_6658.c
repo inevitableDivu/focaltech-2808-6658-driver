@@ -31,7 +31,7 @@
 #define SRAM_FDT_BASE   0x00B8
 #define FDT_VALUE_COUNT 8
 #define FDT_BUF_SIZE    (FDT_VALUE_COUNT * 2)
-#define FDT_SATURATED_VALUE 0x03FF
+#define FDT_INVALID_SENTINEL 0x03FF
 
 #define SCALE_FACTOR    4
 #define IMAGE_WIDTH     (RAW_WIDTH * SCALE_FACTOR)
@@ -124,10 +124,12 @@ read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GErr
     }
 
   bytes_left = self->read_size - self->read_offset;
-  if (transfer->actual_length == 0 || transfer->actual_length > bytes_left)
+  if (transfer->actual_length == 0 ||
+      transfer->actual_length > bytes_left ||
+      (transfer->actual_length % 2) != 0)
     {
       GError *read_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                                                "Invalid SRAM chunk length from FocalTech device");
+                                                "Invalid or unaligned SRAM chunk length from FocalTech device");
       fpi_ssm_mark_failed (transfer->ssm, read_error);
       return;
     }
@@ -243,30 +245,41 @@ focaltech_loop_state (FpiSsm *ssm, FpDevice *dev)
       {
         guint16 deltas[FDT_VALUE_COUNT];
         guint16 max_delta = 0;
-        guint saturated_values = 0;
+        guint invalid_values = 0;
+        guint valid_values = 0;
 
         for (guint i = 0; i < FDT_VALUE_COUNT; i++)
           {
             deltas[i] = ((guint16) self->fdt_buf[i * 2] << 8) |
                         self->fdt_buf[i * 2 + 1];
-            if (deltas[i] == FDT_SATURATED_VALUE)
-              saturated_values++;
-            else if (deltas[i] < FDT_SATURATED_VALUE)
-              max_delta = MAX (max_delta, deltas[i]);
+
+            /*
+             * Ignore the exact 0x03FF value seen in all channels during
+             * false-touch reports. It is not an upper bound: real readings
+             * from this hardware were observed above 1023.
+             */
+            if (deltas[i] == FDT_INVALID_SENTINEL)
+              {
+                invalid_values++;
+                continue;
+              }
+
+            valid_values++;
+            max_delta = MAX (max_delta, deltas[i]);
           }
 
-        if (max_delta > FDT_TOUCH_THRESHOLD)
+        if (valid_values > 0 && max_delta > FDT_TOUCH_THRESHOLD)
           self->touch_streak++;
         else
           self->touch_streak = 0;
 
         self->poll_count++;
         if (self->poll_count % 10 == 0 || self->touch_streak > 0)
-          g_message ("[focaltech_6658] FDT poll #%u: deltas=%u,%u,%u,%u,%u,%u,%u,%u max_valid=%u saturated=%u streak=%u",
+          g_message ("[focaltech_6658] FDT poll #%u: deltas=%u,%u,%u,%u,%u,%u,%u,%u max_valid=%u invalid=%u valid=%u streak=%u",
                      self->poll_count,
                      deltas[0], deltas[1], deltas[2], deltas[3],
                      deltas[4], deltas[5], deltas[6], deltas[7],
-                     max_delta, saturated_values, self->touch_streak);
+                     max_delta, invalid_values, valid_values, self->touch_streak);
 
         if (self->touch_streak >= TOUCH_REQUIRED_STREAK)
           {
