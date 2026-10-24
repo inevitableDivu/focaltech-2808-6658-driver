@@ -97,23 +97,23 @@ vendor driver, not a live Windows USB trace.
 The native libfprint driver enables FDT with register `0x9A = 0x5A`,
 triggers sensing with [`0xC2, 0x3D, 0x00`], and reads eight values from
 `0x00B8`. Status `0x54` on register `0x80` is not accepted as proof of a
-finger. An earlier Python hardware run returned deltas
-`[3098, 3061, 3048, 2952, 2972, 3188, 3158, 877]`; therefore, `0x03FF`
-cannot safely be assumed to be the maximum possible delta. The updated detector
-ignores only values exactly equal to `0x03FF` (an invalid/sentinel pattern
-observed in false-touch reports), while allowing larger 16-bit readings. It
-requires two consecutive polls with at least one non-sentinel value above 50
-before capturing an image from `0x0200`.
+finger. An earlier successful Python hardware run returned status `0x50` with
+deltas `[3098, 3061, 3048, 2952, 2972, 3188, 3158, 877]`; therefore,
+`0x03FF` cannot safely be assumed to be the maximum possible delta. A later
+false-touch run returned status `0x04` with all eight values equal to
+`1028` (`0x0404`) and remained in that state after the finger was lifted.
+The detector now accepts a sample only when status is `0x50`, at least two
+non-sentinel channels are present, and their values are not all identical;
+the same guards are applied in Python and native libfprint. This rejects the
+observed flat `0x0404` pattern without imposing a 10-bit ceiling.
 
-This is a corrective hypothesis based on the captured values, not a vendor-
-confirmed meaning for `0x03FF`. Short Python SRAM reads now fail explicitly
-instead of being parsed as a complete sample. If the sensor still alternates
-between zero and previously observed values, capture USB traffic and verify
-which response/status marks a fresh FDT sample; repeated-equal data alone
-cannot prove staleness because the first reported hardware run also repeated
-its values while detecting a touch. Validate the threshold and image capture
-against the physical sensor. The `0x00B8` / `0x00E8` variant choice is based
-on static analysis of the Windows driver, not a live Windows USB trace.
+The status check is an empirical safeguard: `0x50` was seen with the earlier
+successful sample and is documented here as the AFE-ready status, but the
+vendor has not confirmed that it guarantees a fresh FDT sample. If samples
+remain unready, the missing FDT initialization/refresh sequence may still need
+reverse engineering. Short Python SRAM reads fail explicitly instead of being
+parsed as complete samples. The `0x00B8` / `0x00E8` variant choice is based on
+static analysis of the Windows driver, not a live Windows USB trace.
 
 ---
 
